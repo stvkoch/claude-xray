@@ -70,7 +70,7 @@ def result_text(content, cap=20_000):
         content = "\n".join(b.get("text", "") if b.get("type") == "text" else f"[{b.get('type')}]"
                             for b in content if isinstance(b, dict))
     text = str(content or "")
-    return text if len(text) <= cap else text[:cap] + f"\n… (+{len(text) - cap} caracteres)"
+    return text if len(text) <= cap else text[:cap] + f"\n… (+{len(text) - cap} chars)"
 
 
 def find_skill_md(name, cwd):
@@ -188,7 +188,7 @@ class Session:
                 cmd = re.search(r"<command-name>/?([^<]+)</command-name>", content)
                 if cmd:
                     args = re.search(r"<command-args>(.*?)</command-args>", content, re.S)
-                    self.skill_calls.append((ts, who, cmd.group(1).strip(), "/comando", None,
+                    self.skill_calls.append((ts, who, cmd.group(1).strip(), "/command", None,
                                              args.group(1).strip() if args else ""))
                 elif not content.startswith("<"):
                     self.turns += 1
@@ -264,47 +264,47 @@ def render(s, limit):
     w = max(60, min(cols, 120))
     L = []
     hr = c(DIM, "─" * w)
-    L.append(c(BOLD, f"CLAUDE X-RAY") + c(DIM, f"  sessão {s.id[:8]}  ·  {s.path.parent.name[:50]}  ·  {datetime.now():%H:%M:%S}"))
+    L.append(c(BOLD, f"CLAUDE X-RAY") + c(DIM, f"  session {s.id[:8]}  ·  {s.path.parent.name[:50]}  ·  {datetime.now():%H:%M:%S}"))
     if s.last_prompt:
-        L.append(c(DIM, "último pedido: ") + s.last_prompt[: w - 16])
+        L.append(c(DIM, "last prompt: ") + s.last_prompt[: w - 16])
     L.append(hr)
 
     # context
     frac = s.context / limit if limit else 0
-    L.append(c(BOLD, "CONTEXTO ") + f"{fmt_tok(s.context)} / {fmt_tok(limit)}  ({frac:.0%})  "
-             + c(DIM, f"pico {fmt_tok(s.peak)} · saída total {fmt_tok(s.out_tokens)} · compactações {s.compactions} · modelo {s.model or '?'}"))
+    L.append(c(BOLD, "CONTEXT ") + f"{fmt_tok(s.context)} / {fmt_tok(limit)}  ({frac:.0%})  "
+             + c(DIM, f"peak {fmt_tok(s.peak)} · total output {fmt_tok(s.out_tokens)} · compactions {s.compactions} · model {s.model or '?'}"))
     L.append("  " + bar(frac, w - 4))
     L.append(hr)
 
     # agents
     running = [a for a in s.agents.values() if not a.finished]
     done = [a for a in s.agents.values() if a.finished]
-    L.append(c(BOLD, "AGENTES ") + f"chamados {s.agent_calls}  ·  "
-             + c(YELLOW, f"rodando {len(running)}") + "  ·  " + c(GREEN, f"terminados {len(done)}"))
+    L.append(c(BOLD, "AGENTS ") + f"launched {s.agent_calls}  ·  "
+             + c(YELLOW, f"running {len(running)}") + "  ·  " + c(GREEN, f"finished {len(done)}"))
     show = sorted(running, key=lambda a: a.start, reverse=True) + sorted(done, key=lambda a: a.start, reverse=True)
     for a in show[:8]:
-        st = c(YELLOW, "● rodando ") if not a.finished else c(GREEN, "✓ pronto  ")
+        st = c(YELLOW, "● running ") if not a.finished else c(GREEN, "✓ done     ")
         sk = c(MAGENTA, " skills:" + ",".join(dict.fromkeys(a.skills))) if a.skills else ""
         line = f"  {st} {a.desc[:34]:34} {c(DIM, (a.type or '')[:16]):16} ctx {fmt_tok(a.context):>6}  tools {a.tools:>3}  {c(DIM, a.last_tool[:30])}{sk}"
         L.append(line)
     if len(show) > 8:
-        L.append(c(DIM, f"  … e mais {len(show) - 8}"))
+        L.append(c(DIM, f"  … and {len(show) - 8} more"))
     L.append(hr)
 
     # skills
-    L.append(c(BOLD, "SKILLS ") + f"disponíveis {s.skills_available}  ·  invocadas {len(s.skill_calls)}"
-             + (f"  ·  novas na sessão {len(s.skills_added)}" if s.skills_added else ""))
+    L.append(c(BOLD, "SKILLS ") + f"available {s.skills_available}  ·  invoked {len(s.skill_calls)}"
+             + (f"  ·  new this session {len(s.skills_added)}" if s.skills_added else ""))
     for ts, who, name, how, *_ in s.skill_calls[-6:]:
         L.append(f"  {c(DIM, hhmm(ts))}  {c(MAGENTA, name):40} {c(DIM, how)}  {c(DIM, who)}")
     for ts, name in s.skills_added[-3:]:
-        L.append(f"  {c(DIM, hhmm(ts))}  {c(CYAN, '+ ' + name)}  {c(DIM, 'adicionada à lista')}")
+        L.append(f"  {c(DIM, hhmm(ts))}  {c(CYAN, '+ ' + name)}  {c(DIM, 'added to listing')}")
     if s.skill_reads:
         reads = "  ·  ".join(f"{k}: {', '.join(sorted(v))}" for k, v in list(s.skill_reads.items())[-3:])
-        L.append(c(DIM, "  arquivos de skill lidos → ") + reads[: w - 28])
+        L.append(c(DIM, "  skill files read → ") + reads[: w - 28])
     L.append(hr)
 
     # feed
-    L.append(c(BOLD, "ATIVIDADE RECENTE"))
+    L.append(c(BOLD, "RECENT ACTIVITY"))
     for ts, who, name, detail, *_ in sorted(s.feed, key=lambda x: x[0])[-10:]:
         whoc = c(CYAN, f"{who:12}") if who != "main" else c(DIM, f"{who:12}")
         L.append(f"  {c(DIM, hhmm(ts))}  {whoc} {c(BOLD, f'{name[:10]:10}')} {detail[: w - 38]}")
@@ -379,15 +379,15 @@ def code(text, lexer):
 
 def result_block(s, tid):
     if not tid or tid not in s.results:
-        return Text("(sem resultado ainda)", style="dim italic")
+        return Text("(no result yet)", style="dim italic")
     ts, text, err = s.results[tid]
-    head = Text(f"{hhmm(ts)}  ", style="dim") + (Text("ERRO", style="bold red") if err else Text("ok", style="green"))
-    return Group(head, Text(text or "(vazio)", style="red" if err else ""))
+    head = Text(f"{hhmm(ts)}  ", style="dim") + (Text("ERROR", style="bold red") if err else Text("ok", style="green"))
+    return Group(head, Text(text or "(empty)", style="red" if err else ""))
 
 
 class Detail(ModalScreen):
     """Scrollable read-only dialog."""
-    BINDINGS = [("escape", "close", "fechar"), ("q", "close", "fechar")]
+    BINDINGS = [("escape", "close", "close"), ("q", "close", "close")]
 
     def __init__(self, title, body):
         super().__init__()
@@ -396,7 +396,7 @@ class Detail(ModalScreen):
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="detail", classes="dialog") as v:
             v.border_title = self.box_title
-            v.border_subtitle = "Esc fecha · ↑↓ PgUp PgDn rolam"
+            v.border_subtitle = "Esc closes · ↑↓ PgUp PgDn scroll"
             yield Static(self.body)
 
     def on_mount(self):
@@ -407,7 +407,7 @@ class Detail(ModalScreen):
 
 
 class ContextDetail(ModalScreen):
-    BINDINGS = [("escape", "close", "fechar"), ("q", "close", "fechar")]
+    BINDINGS = [("escape", "close", "close"), ("q", "close", "close")]
 
     def __init__(self, s, limit):
         super().__init__()
@@ -416,27 +416,27 @@ class ContextDetail(ModalScreen):
     def compose(self) -> ComposeResult:
         s, h = self.s, self.s.ctx_hist
         with Vertical(id="ctxdialog", classes="dialog") as v:
-            v.border_title = f"Contexto · sessão {s.id[:8]}"
-            v.border_subtitle = "Esc fecha · ↑↓ navega"
+            v.border_title = f"Context · session {s.id[:8]}"
+            v.border_subtitle = "Esc closes · ↑↓ navigate"
             last = h[-1] if h else None
             frac = s.context / self.limit if self.limit else 0
             yield Static(kv(
-                ("atual", Text(f"{s.context:,} tokens  ({frac:.1%} de {fmt_tok(self.limit)})", style="bold")),
-                ("restante", f"{max(0, self.limit - s.context):,} tokens"),
-                ("pico", f"{s.peak:,}"),
-                ("última chamada", f"input {last[2]:,} · cache lido {last[3]:,} · cache criado {last[4]:,} · saída {last[5]:,}"
+                ("current", Text(f"{s.context:,} tokens  ({frac:.1%} of {fmt_tok(self.limit)})", style="bold")),
+                ("remaining", f"{max(0, self.limit - s.context):,} tokens"),
+                ("peak", f"{s.peak:,}"),
+                ("last call", f"input {last[2]:,} · cache read {last[3]:,} · cache created {last[4]:,} · output {last[5]:,}"
                  if last else "—"),
-                ("saída total", f"{s.out_tokens:,} tokens em {len(h)} respostas"),
-                ("compactações", ", ".join(hhmm(t) for t in s.compact_ts) or "nenhuma"),
-                ("modelo", s.model or "?"),
+                ("total output", f"{s.out_tokens:,} tokens in {len(h)} responses"),
+                ("compactions", ", ".join(hhmm(t) for t in s.compact_ts) or "none"),
+                ("model", s.model or "?"),
             ))
-            yield Label(Text("evolução do contexto (uma barra por resposta do modelo)", style="dim"))
+            yield Label(Text("context over time (one bar per model response)", style="dim"))
             yield Sparkline([r[1] for r in h] or [0], id="spark")
             yield DataTable(id="ctxtable", cursor_type="row", zebra_stripes=True)
 
     def on_mount(self):
         t = self.query_one("#ctxtable", DataTable)
-        t.add_columns("hora", "contexto", "Δ", "input", "cache lido", "cache criado", "saída", "pedido do turno")
+        t.add_columns("time", "context", "Δ", "input", "cache read", "cache created", "output", "turn prompt")
         prev = 0
         rows = []
         for ts, ctx, inp, cr, cn, out, prompt, _ in self.s.ctx_hist:
@@ -456,7 +456,7 @@ class ContextDetail(ModalScreen):
 
 class Picker(ModalScreen):
     """Lists recent sessions. Dismisses with a Path, AUTO (follow newest) or None (cancel)."""
-    BINDINGS = [("escape", "cancel", "voltar"), ("a", "toggle_all", "todos os projetos")]
+    BINDINGS = [("escape", "cancel", "back"), ("a", "toggle_all", "all projects")]
 
     def __init__(self, app_args, can_cancel):
         super().__init__()
@@ -465,26 +465,26 @@ class Picker(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="picker", classes="dialog"):
             yield DataTable(id="ptable", cursor_type="row", zebra_stripes=True)
-            yield Label(Text("Enter abre · a alterna projeto atual/todos · Esc volta", style="dim"))
+            yield Label(Text("Enter opens · a toggles current/all projects · Esc goes back", style="dim"))
 
     def on_mount(self):
         self.load()
 
     def load(self):
         box = self.query_one("#picker")
-        box.border_title = "Sessões recentes · " + ("todos os projetos" if self.args.all else "projeto atual")
+        box.border_title = "Recent sessions · " + ("all projects" if self.args.all else "current project")
         t = self.query_one(DataTable)
         t.clear(columns=True)
-        cols = ["quando", "sessão"] + (["projeto"] if self.args.all else []) + ["último pedido"]
+        cols = ["when", "session"] + (["project"] if self.args.all else []) + ["last prompt"]
         t.add_columns(*cols)
-        auto = [Text("⟳ seguir a mais recente", style="bold cyan"), Text("auto", style="dim")]
-        auto += [""] * (len(cols) - len(auto) - 1) + [Text("troca sozinho após /clear", style="dim")]
+        auto = [Text("⟳ follow the newest", style="bold cyan"), Text("auto", style="dim")]
+        auto += [""] * (len(cols) - len(auto) - 1) + [Text("switches automatically after /clear", style="dim")]
         t.add_row(*auto, key=AUTO)
         for f in list_sessions(self.args.all, self.args.cwd, self.args.list):
-            row = [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d/%m %H:%M"), f.stem[:8]]
+            row = [datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M"), f.stem[:8]]
             if self.args.all:
                 row.append(f.parent.name[-30:])
-            row.append(Text(last_prompt_of(f)[:90] or "(sem pedidos)"))
+            row.append(Text(last_prompt_of(f)[:90] or "(no prompts)"))
             t.add_row(*row, key=str(f))
         t.focus()
 
@@ -522,9 +522,9 @@ class XRay(App):
               border-title-style: bold; border-subtitle-color: $text-muted; }
     #spark { height: 4; margin-bottom: 1; }
     """
-    BINDINGS = [("q", "quit", "sair"), ("s", "pick", "sessões"), ("c", "context", "contexto"),
-                ("1", "focus('agents')", "agentes"), ("2", "focus('skills')", "skills"),
-                ("3", "focus('feed')", "atividade"), ("p", "pause", "pausar")]
+    BINDINGS = [("q", "quit", "quit"), ("s", "pick", "sessions"), ("c", "context", "context"),
+                ("1", "focus('agents')", "agents"), ("2", "focus('skills')", "skills"),
+                ("3", "focus('feed')", "activity"), ("p", "pause", "pause")]
 
     def __init__(self, args):
         super().__init__()
@@ -547,15 +547,15 @@ class XRay(App):
         yield Footer()
 
     def on_mount(self):
-        self.query_one("#agents", DataTable).add_columns("", "descrição", "tipo", "ctx", "tools", "última ferramenta", "skills")
-        self.query_one("#skills", DataTable).add_columns("hora", "skill", "como", "quem")
-        self.query_one("#feed", DataTable).add_columns("hora", "quem", "ferramenta", "detalhe", "")
-        self.query_one("#feedbox").border_title = "Atividade recente · Enter abre detalhes"
+        self.query_one("#agents", DataTable).add_columns("", "description", "type", "ctx", "tools", "last tool", "skills")
+        self.query_one("#skills", DataTable).add_columns("time", "skill", "how", "who")
+        self.query_one("#feed", DataTable).add_columns("time", "who", "tool", "detail", "")
+        self.query_one("#feedbox").border_title = "Recent activity · Enter opens details"
         self.query_one("#feed").focus()
         if self.args.session:
             path = resolve_session(self.args.session)
             if not path:
-                self.exit(message=f"Sessão {self.args.session} não encontrada.")
+                self.exit(message=f"Session {self.args.session} not found.")
                 return
             self.open(path)
         elif self.args.latest:
@@ -582,7 +582,7 @@ class XRay(App):
             self.open(path)
         else:
             self.session = None
-            self.sub_title = "aguardando uma sessão…"
+            self.sub_title = "waiting for a session…"
 
     def open(self, path):
         self.session = Session(path)
@@ -599,7 +599,7 @@ class XRay(App):
             if newest and newest != cur and (cur is None or born(newest) > born(cur)
                                              or newest.stat().st_mtime > cur.stat().st_mtime + 2):
                 self.open(newest)
-                self.notify(f"Seguindo nova sessão {newest.stem[:8]}")
+                self.notify(f"Following new session {newest.stem[:8]}")
                 return
         if self.session:
             self.session.update()
@@ -611,7 +611,7 @@ class XRay(App):
 
     def action_pause(self):
         self.paused = not self.paused
-        self.notify("Pausado" if self.paused else "Retomado")
+        self.notify("Paused" if self.paused else "Resumed")
 
     def action_focus(self, wid):
         self.query_one(f"#{wid}").focus()
@@ -639,9 +639,9 @@ class XRay(App):
     def detail_feed(self, entry):
         s = self.session
         ts, who, name, short, tid, inp = entry
-        parts = [kv(("quando", hhmm(ts)), ("quem", who), ("ferramenta", Text(name, style="bold")),
-                    ("resumo", short), ("id", tid or "—")),
-                 Rule("entrada", style="dim")]
+        parts = [kv(("when", hhmm(ts)), ("who", who), ("tool", Text(name, style="bold")),
+                    ("summary", short), ("id", tid or "—")),
+                 Rule("input", style="dim")]
         if name == "Bash" and inp.get("command"):
             parts.append(code(inp["command"], "bash"))
             rest = {k: v for k, v in inp.items() if k != "command"}
@@ -649,22 +649,22 @@ class XRay(App):
                 parts.append(code(json.dumps(rest, indent=2, ensure_ascii=False), "json"))
         else:
             parts.append(code(json.dumps(inp, indent=2, ensure_ascii=False), "json"))
-        parts += [Rule("resultado", style="dim"), result_block(s, tid)]
+        parts += [Rule("result", style="dim"), result_block(s, tid)]
         return f"{name} · {short[:60]}", Group(*parts)
 
     def detail_skillcall(self, call):
         s = self.session
         ts, who, name, how, tid, args = call
-        parts = [kv(("skill", Text(name, style="bold magenta")), ("quando", hhmm(ts)), ("como", how),
-                    ("quem", who), ("argumentos", args or "—"))]
+        parts = [kv(("skill", Text(name, style="bold magenta")), ("when", hhmm(ts)), ("how", how),
+                    ("who", who), ("arguments", args or "—"))]
         parts += self._skill_info(name)
         if tid:
-            parts += [Rule("resultado da chamada", style="dim"), result_block(s, tid)]
+            parts += [Rule("call result", style="dim"), result_block(s, tid)]
         return f"Skill · {name}", Group(*parts)
 
     def detail_skillname(self, data):
         name, note = data
-        return f"Skill · {name}", Group(kv(("skill", Text(name, style="bold magenta")), ("evento", note)),
+        return f"Skill · {name}", Group(kv(("skill", Text(name, style="bold magenta")), ("event", note)),
                                         *self._skill_info(name))
 
     def _skill_info(self, name):
@@ -673,16 +673,16 @@ class XRay(App):
         reads = s.skill_reads.get(base) or s.skill_reads.get(name)
         out = []
         if reads:
-            out.append(kv(("arquivos lidos", ", ".join(sorted(reads)))))
+            out.append(kv(("files read", ", ".join(sorted(reads)))))
         md = find_skill_md(name, s.cwd or self.args.cwd)
         if md:
             text = md.read_text(errors="replace")
             lines = text.splitlines()
             out += [Rule(str(md).replace(str(Path.home()), "~"), style="dim"),
-                    code("\n".join(lines[:150]) + (f"\n\n… (+{len(lines) - 150} linhas)" if len(lines) > 150 else ""),
+                    code("\n".join(lines[:150]) + (f"\n\n… (+{len(lines) - 150} lines)" if len(lines) > 150 else ""),
                          "markdown")]
         else:
-            out.append(Text("SKILL.md não encontrado localmente (skill embutida ou de plugin remoto).", style="dim italic"))
+            out.append(Text("SKILL.md not found locally (built-in skill or remote plugin).", style="dim italic"))
         return out
 
     def detail_agent(self, a):
@@ -695,13 +695,13 @@ class XRay(App):
             lines.append(f"{hhmm(ts)}  ", style="dim")
             lines.append(f"{name:12}", style="bold red" if err else "bold")
             lines.append(f"{short}\n")
-        return f"Agente · {a.desc[:60]}", Group(
-            kv(("descrição", a.desc), ("tipo", a.type or "—"), ("modelo", a.model or "—"),
-               ("estado", Text("pronto", style="green") if a.finished else Text("rodando", style="yellow")),
-               ("contexto", fmt_tok(a.context)), ("ferramentas", a.tools),
+        return f"Agent · {a.desc[:60]}", Group(
+            kv(("description", a.desc), ("type", a.type or "—"), ("model", a.model or "—"),
+               ("status", Text("done", style="green") if a.finished else Text("running", style="yellow")),
+               ("context", fmt_tok(a.context)), ("tools", a.tools),
                ("skills", ", ".join(dict.fromkeys(a.skills)) or "—"), ("id", a.id)),
-            Rule("ferramentas usadas (Enter na Atividade mostra cada uma)", style="dim"),
-            lines or Text("nenhuma ainda", style="dim"))
+            Rule("tools used (Enter in Activity shows each one)", style="dim"),
+            lines or Text("none yet", style="dim"))
 
     # ---- drawing -----------------------------------------------------------
     def fill(self, tid, rows):
@@ -723,17 +723,17 @@ class XRay(App):
     def refresh_view(self):
         s = self.session
         limit = self.limit()
-        mode = "seguindo a mais recente" if self.follow else "sessão fixa"
-        self.sub_title = f"{s.id[:8]} · {s.path.parent.name[-40:]} · {mode}" + (" · PAUSADO" if self.paused else "")
+        mode = "following newest" if self.follow else "pinned session"
+        self.sub_title = f"{s.id[:8]} · {s.path.parent.name[-40:]} · {mode}" + (" · PAUSED" if self.paused else "")
 
         self.query_one("#prompt", Static).update(
-            Text.assemble(("último pedido: ", "dim"), s.last_prompt or "—"))
+            Text.assemble(("last prompt: ", "dim"), s.last_prompt or "—"))
         frac = s.context / limit if limit else 0
         color = "green" if frac < 0.5 else "yellow" if frac < 0.8 else "red"
         self.query_one("#ctx", Static).update(Text.assemble(
-            ("Contexto ", "bold"), (f"{fmt_tok(s.context)} / {fmt_tok(limit)} ({frac:.0%})", f"bold {color}"),
-            (f"   pico {fmt_tok(s.peak)} · saída total {fmt_tok(s.out_tokens)} · "
-             f"compactações {s.compactions} · modelo {s.model or '?'}   ", "dim"), ("[c] detalhes", "dim italic")))
+            ("Context ", "bold"), (f"{fmt_tok(s.context)} / {fmt_tok(limit)} ({frac:.0%})", f"bold {color}"),
+            (f"   peak {fmt_tok(s.peak)} · total output {fmt_tok(s.out_tokens)} · "
+             f"compactions {s.compactions} · model {s.model or '?'}   ", "dim"), ("[c] details", "dim italic")))
         barw = max(10, self.query_one("#ctxbar").size.width - 2)
         n = int(round(max(0.0, min(1.0, frac)) * barw))
         self.query_one("#ctxbar", Static).update(
@@ -742,11 +742,11 @@ class XRay(App):
         running = [a for a in s.agents.values() if not a.finished]
         done = [a for a in s.agents.values() if a.finished]
         self.query_one("#agentsbox").border_title = (
-            f"[1] Agentes · chamados {s.agent_calls} · rodando {len(running)} · terminados {len(done)}")
+            f"[1] Agents · launched {s.agent_calls} · running {len(running)} · finished {len(done)}")
         self.query_one("#skillsbox").border_title = (
-            f"[2] Skills · disponíveis {s.skills_available} · invocadas {len(s.skill_calls)}"
-            + (f" · novas {len(s.skills_added)}" if s.skills_added else ""))
-        self.query_one("#feedbox").border_title = "[3] Atividade recente · Enter abre detalhes"
+            f"[2] Skills · available {s.skills_available} · invoked {len(s.skill_calls)}"
+            + (f" · new {len(s.skills_added)}" if s.skills_added else ""))
+        self.query_one("#feedbox").border_title = "[3] Recent activity · Enter opens details"
 
         sig = (s.id, s.agent_calls, tuple((a.id, a.finished, a.tools, a.context, a.desc) for a in s.agents.values()),
                len(s.skill_calls), len(s.skills_added), sum(map(len, s.skill_reads.values())),
@@ -759,7 +759,7 @@ class XRay(App):
         show = sorted(running, key=lambda a: a.start, reverse=True) + sorted(done, key=lambda a: a.start, reverse=True)
         self.fill("agents", [
             (f"ag:{a.id}",
-             (Text("● rodando", style="bold yellow") if not a.finished else Text("✓ pronto", style="green"),
+             (Text("● running", style="bold yellow") if not a.finished else Text("✓ done", style="green"),
               Text(a.desc[:40]), Text(a.type, style="dim"), fmt_tok(a.context), str(a.tools),
               Text(a.last_tool[:40], style="dim"), Text(",".join(dict.fromkeys(a.skills)), style="magenta")),
              ("agent", a)) for a in show])
@@ -770,11 +770,11 @@ class XRay(App):
             rows.append((f"sc:{i}", (hhmm(ts), Text(name, style="magenta"), Text(how, style="dim"), Text(who, style="dim")),
                          ("skillcall", call)))
         for i, (ts, name) in reversed(list(enumerate(s.skills_added))):
-            rows.append((f"sa:{i}", (hhmm(ts), Text("+ " + name, style="cyan"), Text("adicionada", style="dim"), ""),
-                         ("skillname", (name, f"adicionada à lista às {hhmm(ts)}"))))
+            rows.append((f"sa:{i}", (hhmm(ts), Text("+ " + name, style="cyan"), Text("added", style="dim"), ""),
+                         ("skillname", (name, f"added to listing at {hhmm(ts)}"))))
         for k, v in s.skill_reads.items():
-            rows.append((f"sr:{k}", ("", Text(k, style="magenta"), Text("leu " + ", ".join(sorted(v)), style="dim"), ""),
-                         ("skillname", (k, "arquivos da skill lidos"))))
+            rows.append((f"sr:{k}", ("", Text(k, style="magenta"), Text("read " + ", ".join(sorted(v)), style="dim"), ""),
+                         ("skillname", (k, "skill files read"))))
         self.fill("skills", rows)
 
         rows = []
@@ -803,7 +803,7 @@ def main():
     if args.once or not sys.stdout.isatty():
         path = resolve_session(args.session) if args.session else newest_session(args.all, args.cwd)
         if not path:
-            sys.exit("Nenhuma sessão encontrada. Use --all ou --session ID.")
+            sys.exit("No session found. Use --all or --session ID.")
         s = Session(path)
         s.update()
         print(render(s, args.limit))
