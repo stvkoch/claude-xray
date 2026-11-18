@@ -1,6 +1,6 @@
 # claude-xray (Agent X-Ray)
 
-Live X-ray of AI coding agent sessions in your terminal, built with [Textual](https://github.com/Textualize/textual).
+Live X-ray of AI coding agent sessions in your terminal.
 
 Supports **Claude Code**, **OpenAI Codex**, **Cursor**, and **AGY** (Google Antigravity / Gemini CLI).
 
