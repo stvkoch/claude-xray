@@ -18,7 +18,7 @@ Usage:
   claude-xray --all           # follow the newest session in any project
   claude-xray --session ID    # follow a specific session id
   claude-xray --once          # print one snapshot and exit
-  claude-xray --limit 1000000 # context window size used for the % bar (default: auto)
+  claude-xray --limit 1000000 # context window size used for the % bar (default: from the model)
 """
 import argparse, hashlib, json, os, re, shutil, sys, time
 from datetime import datetime
@@ -141,6 +141,18 @@ class Tail:
 def msg_hash(msg):
     return hashlib.sha256(json.dumps(msg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
                           .encode()).hexdigest()
+
+
+# Models with a 1M-token window (Claude API model reference, 2026-11). Everything else,
+# e.g. Haiku 4.5, Sonnet 4.5, Opus 4.5 and older, has 200K unless run with the [1m] suffix.
+ONE_M_MODELS = re.compile(r"claude-(fable|mythos)|claude-(opus|sonnet|haiku)-5|claude-opus-4-[678]|claude-sonnet-4-6")
+
+
+def context_window(model, peak=0):
+    """Context window for a model id; past-200K usage proves a 1M window whatever the id says."""
+    if "[1m]" in (model or "").lower() or ONE_M_MODELS.search(model or "") or peak > 200_000:
+        return 1_000_000
+    return 200_000
 
 
 def is_real_prompt(text):
@@ -615,7 +627,7 @@ def bar(frac, width):
 
 def render(s, limit):
     if not limit:  # auto: a session past 200k must be running with the 1M window
-        limit = 1_000_000 if s.peak > 200_000 else 200_000
+        limit = context_window(s.model, s.peak)
     cols = shutil.get_terminal_size((100, 40)).columns
     w = max(60, min(cols, 120))
     L = []
@@ -1329,7 +1341,7 @@ class XRay(App):
         self.query_one(f"#{wid}").focus()
 
     def limit(self):
-        return self.args.limit or (1_000_000 if self.session.peak > 200_000 else 200_000)
+        return self.args.limit or context_window(self.session.model, self.session.peak)
 
     def action_context(self):
         if self.session:
@@ -1524,7 +1536,7 @@ def main():
     ap.add_argument("--headless", action="store_true",
                     help="also list/follow headless `claude -p` / SDK runs (hidden by default)")
     ap.add_argument("--cwd", default=os.getcwd(), help="project directory (default: current directory)")
-    ap.add_argument("--limit", type=int, default=0, help="context window for the %% bar (default: auto, 200k or 1M)")
+    ap.add_argument("--limit", type=int, default=0, help="context window for the %% bar (default: from the model, 200k or 1M)")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--once", action="store_true", help="print one plain-text snapshot and exit")
     ap.add_argument("--latest", "-l", action="store_true", help="skip the menu and follow the newest session")
