@@ -16,16 +16,20 @@ It is read-only: it never writes to Claude's files.
 
 ## Install
 
+Needs [uv](https://docs.astral.sh/uv/) (`brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`):
+
 ```sh
-git clone https://github.com/stvkoch/claude-xray.git ~/.local/share/claude-xray
-cd ~/.local/share/claude-xray
-python3 -m venv venv && venv/bin/pip install -r requirements.txt
-cat > ~/.local/bin/claude-xray <<'SH'
-#!/bin/sh
-exec "$HOME/.local/share/claude-xray/venv/bin/python" "$HOME/.local/share/claude-xray/claude-xray" "$@"
-SH
-chmod +x ~/.local/bin/claude-xray
+uv tool install git+https://github.com/stvkoch/claude-xray
 ```
+
+Or try it without installing:
+
+```sh
+uvx --from git+https://github.com/stvkoch/claude-xray claude-xray
+```
+
+Update with `uv tool upgrade claude-xray`, remove with `uv tool uninstall claude-xray`. `pipx install git+https://github.com/stvkoch/claude-xray` works too. Requires Python 3.10+ (uv fetches one if needed).
+
 <img height="500" alt="image" src="https://github.com/user-attachments/assets/0a627e65-aa92-4691-96d9-4fbfcc9f94c9" />
 <img height="500" alt="image" src="https://github.com/user-attachments/assets/eb158389-a43a-409f-b710-8df6cbdefca3" />
 <img height="500" alt="image" src="https://github.com/user-attachments/assets/3799e1ab-b115-4a93-a224-4320f72fd7b5" />
@@ -42,7 +46,13 @@ claude-xray --all           # list/follow sessions of every project
 claude-xray --session ID    # open a specific session id
 claude-xray --once          # print a plain-text snapshot and exit
 claude-xray --headless      # also list headless `claude -p` / SDK runs (hidden by default)
+claude-xray --cwd DIR       # sessions of another project directory (default: current directory)
+claude-xray --list 30       # how many sessions the picker shows (default 15)
+claude-xray --interval 2    # refresh every 2 seconds (default 1)
+claude-xray --limit 1000000 # context window for the % bar (default: from the model)
 ```
+
+`-l` is short for `--latest`. The context window is inferred from the model id: 1M for models with a 1M-token window or a `[1m]` suffix, 200K otherwise, and 1M once a session goes past 200K whatever the id says.
 
 | Key | Action |
 | --- | --- |
@@ -52,7 +62,9 @@ claude-xray --headless      # also list headless `claude -p` / SDK runs (hidden 
 | `b` | brief vs result: the selected agent, or the newest finished one |
 | `[` `]` | previous / next agent (inside focus and brief vs result) |
 | `v` | full output instead of compact (inside focus) |
+| `f` | follow (auto-scroll) on/off (inside focus) |
 | `c` | context details (`d` inside it: what's in the context) |
+| `o` / `g` | inside "what's in the context": request order vs size, group by category |
 | `s` | switch session |
 | `a` / `h` | in the session list: all projects / show headless `claude -p` runs |
 | `p` | pause refresh |
