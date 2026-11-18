@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""claude-xray: live X-ray of a Claude Code session.
+
+Reads the session transcript Claude Code writes to ~/.claude/projects/ and
+shows, refreshing every second:
+  - context size of the main conversation (and peak, compactions)
+  - subagents: launched / running / finished, with their own context size
+  - skills: invoked (Skill tool or /command), available count, newly added
+  - a feed of the latest tool calls (main thread and subagents)
+
+Read-only: it never writes to Claude's files.
+
+Usage:
+  claude-xray                 # pick a session from a list (Textual UI)
+  claude-xray --latest        # follow the newest session, switching after /clear
+  claude-xray --all           # follow the newest session in any project
+  claude-xray --session ID    # follow a specific session id
+  claude-xray --once          # print one snapshot and exit
+  claude-xray --limit 1000000 # context window size used for the % bar (default: auto)
+"""
+import argparse, json, os, re, shutil, sys, time
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+NO_COLOR = not sys.stdout.isatty() or os.environ.get("NO_COLOR")
+
+def c(code, s):
+    return s if NO_COLOR else f"\033[{code}m{s}\033[0m"
+BOLD, DIM, RED, GREEN, YELLOW, CYAN, MAGENTA = "1", "2", "31", "32", "33", "36", "35"
+
+def fmt_tok(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.2f}M"
+    if n >= 1000: return f"{n/1000:.1f}k"
+    return str(n)
+
+def hhmm(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+    except Exception:
+        return "--:--:--"
+
+def project_dir_for(cwd):
+    return PROJECTS / re.sub(r"[/.]", "-", str(cwd))
+
+def newest_session(all_projects, cwd):
+    dirs = [d for d in PROJECTS.iterdir() if d.is_dir()] if all_projects else [project_dir_for(cwd)]
+    files = [f for d in dirs if d.exists() for f in d.glob("*.jsonl")]
+    return max(files, key=lambda f: f.stat().st_mtime) if files else None
+
+def born(f):
+    st = f.stat()
+    return getattr(st, "st_birthtime", st.st_ctime)
+
+def context_of(usage):
+    return (usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0))
+
+def short_input(name, inp):
+    if name == "Bash": return inp.get("description") or inp.get("command", "")[:60]
+    if name in ("Read", "Write", "Edit"): return Path(inp.get("file_path", "")).name
+    if name == "Agent": return inp.get("description", "")
+    if name == "Skill": return inp.get("skill", "")
+    if name in ("Grep", "Glob"): return inp.get("pattern", "")
+    return next((str(v)[:50] for v in inp.values() if isinstance(v, str)), "")
+
+
+def result_text(content, cap=20_000):
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") if b.get("type") == "text" else f"[{b.get('type')}]"
+                            for b in content if isinstance(b, dict))
+    text = str(content or "")
+    return text if len(text) <= cap else text[:cap] + f"\n… (+{len(text) - cap} caracteres)"
+
+
+def find_skill_md(name, cwd):
+    base = name.split(":")[-1]
+    roots = [Path(cwd) / ".claude" / "skills"] if cwd else []
+    roots += [Path.home() / ".agents" / "skills", Path.home() / ".claude" / "skills"]
+    for r in roots:
+        if (r / base / "SKILL.md").exists():
+            return r / base / "SKILL.md"
+    plug = Path.home() / ".claude" / "plugins"
+    return next(plug.glob(f"**/skills/{base}/SKILL.md"), None) if plug.exists() else None
+
+
+class Tail:
+    """Reads only the new complete lines of a growing JSONL file."""
+    def __init__(self, path):
+        self.path, self.pos, self.buf = Path(path), 0, ""
+
+    def read(self):
+        try:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self.pos)
+                data = f.read()
+                self.pos = f.tell()
+        except FileNotFoundError:
+            return []
+        self.buf += data
+        *lines, self.buf = self.buf.split("\n")
+        out = []
+        for l in lines:
+            try: out.append(json.loads(l))
+            except Exception: pass
+        return out
+
+
+class Agent:
+    def __init__(self, aid):
+        self.id, self.desc, self.type, self.model = aid, "", "", ""
+        self.finished, self.context, self.tools, self.last_tool = False, 0, 0, ""
+        self.skills, self.start = [], ""
+
+
+class Session:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.id = self.path.stem
+        self.tail = Tail(path)
+        self.sub_dir = self.path.parent / self.id / "subagents"
+        self.agent_tails, self.agents = {}, {}
+        self.context, self.peak, self.out_tokens, self.compactions = 0, 0, 0, 0
+        self.turns, self.model = 0, ""
+        self.skill_calls = []      # (time, who, skill, how)
+        self.skills_available = 0
+        self.skills_added = []     # names that appeared in a later skill listing
+        self._known_skills = None
+        self.skill_reads = {}      # skill name -> set of files read inside it
+        self.feed = []             # (time, who, tool, detail)
+        self.agent_calls = 0
+        self.last_prompt = ""
+        self.results = {}          # tool_use_id -> (time, text, is_error)
+        self.ctx_hist = []         # (time, ctx, input, cache_read, cache_new, output, prompt, msg_id)
+        self.compact_ts = []
+        self.cwd = ""
+
+    # ---- main transcript -------------------------------------------------
+    def update(self):
+        for e in self.tail.read():
+            self._event(e, who="main")
+        if self.sub_dir.exists():
+            for f in self.sub_dir.glob("agent-*.jsonl"):
+                aid = f.stem.replace("agent-", "")
+                t = self.agent_tails.setdefault(aid, Tail(f))
+                a = self.agents.setdefault(aid, Agent(aid))
+                for e in t.read():
+                    self._agent_event(a, e)
+            for m in self.sub_dir.glob("agent-*.meta.json"):
+                aid = m.name.replace("agent-", "").replace(".meta.json", "")
+                a = self.agents.setdefault(aid, Agent(aid))
+                try:
+                    meta = json.loads(m.read_text())
+                    a.desc = meta.get("description", a.desc)
+                    a.type = meta.get("agentType", a.type)
+                    a.model = meta.get("model", a.model)
+                    a.finished = bool(meta.get("finished", False))
+                except Exception:
+                    pass
+
+    def _event(self, e, who):
+        t = e.get("type")
+        ts = e.get("timestamp", "")
+        self.cwd = self.cwd or e.get("cwd", "")
+        if t == "assistant" and not e.get("isSidechain"):
+            m = e.get("message", {})
+            self.model = m.get("model", self.model)
+            u = m.get("usage")
+            if u:
+                self.context = context_of(u)
+                self.peak = max(self.peak, self.context)
+                mid = m.get("id")
+                rec = (ts, self.context, u.get("input_tokens", 0), u.get("cache_read_input_tokens", 0),
+                       u.get("cache_creation_input_tokens", 0), u.get("output_tokens", 0), self.last_prompt, mid)
+                if self.ctx_hist and mid and self.ctx_hist[-1][-1] == mid:
+                    self.out_tokens += rec[5] - self.ctx_hist[-1][5]
+                    self.ctx_hist[-1] = rec
+                else:
+                    self.out_tokens += rec[5]
+                    self.ctx_hist.append(rec)
+            for blk in m.get("content", []):
+                if blk.get("type") == "tool_use":
+                    self._tool(ts, who, blk["name"], blk.get("input", {}), blk.get("id"))
+        elif t == "user":
+            content = e.get("message", {}).get("content")
+            self._results(ts, content)
+            if isinstance(content, str):
+                cmd = re.search(r"<command-name>/?([^<]+)</command-name>", content)
+                if cmd:
+                    args = re.search(r"<command-args>(.*?)</command-args>", content, re.S)
+                    self.skill_calls.append((ts, who, cmd.group(1).strip(), "/comando", None,
+                                             args.group(1).strip() if args else ""))
+                elif not content.startswith("<"):
+                    self.turns += 1
+                    self.last_prompt = content.strip().replace("\n", " ")
+            elif isinstance(content, list) and any(b.get("type") == "text" and not b.get("text", "").startswith("<")
+                                                   for b in content if isinstance(b, dict)):
+                self.turns += 1
+        elif t == "attachment":
+            a = e.get("attachment", {})
+            if a.get("type") == "skill_listing":
+                names = [n.rstrip(":") for n in re.findall(r"^- ([\w:.\-/]+)", a.get("content", ""), re.M)]
+                if self._known_skills is not None:
+                    for n in names:
+                        if n not in self._known_skills:
+                            self.skills_added.append((ts, n))
+                self._known_skills = (self._known_skills or set()) | set(names)
+                self.skills_available = len(self._known_skills)
+        elif t == "system" and e.get("subtype") in ("compact_boundary", "compaction"):
+            self.compactions += 1
+            self.compact_ts.append(ts)
+
+    def _results(self, ts, content):
+        if not isinstance(content, list):
+            return
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                self.results[b.get("tool_use_id")] = (ts, result_text(b.get("content")), bool(b.get("is_error")))
+
+    def _tool(self, ts, who, name, inp, tid=None):
+        self.feed.append((ts, who, name, short_input(name, inp), tid, inp))
+        self.feed = sorted(self.feed, key=lambda x: x[0])[-300:]
+        if name in ("Agent", "Task"):
+            self.agent_calls += 1
+        if name == "Skill":
+            self.skill_calls.append((ts, who, inp.get("skill", "?"), "auto/Skill", tid, inp.get("args", "")))
+        text = inp.get("file_path", "") if name == "Read" else inp.get("command", "") if name == "Bash" else ""
+        for m in re.finditer(r"/skills/(?:[^/\s]+/)*?([^/\s]+)/(SKILL\.md|(?:references|scripts|assets)/[^\s'\"|;&]+)", text):
+            self.skill_reads.setdefault(m.group(1), set()).add(Path(m.group(2)).name)
+
+    # ---- subagent transcripts -------------------------------------------
+    def _agent_event(self, a, e):
+        if e.get("type") == "user":
+            self._results(e.get("timestamp", ""), e.get("message", {}).get("content"))
+            return
+        if e.get("type") != "assistant":
+            return
+        ts = e.get("timestamp", "")
+        a.start = a.start or ts
+        m = e.get("message", {})
+        u = m.get("usage")
+        if u:
+            a.context = context_of(u)
+        for blk in m.get("content", []):
+            if blk.get("type") == "tool_use":
+                a.tools += 1
+                a.last_tool = f'{blk["name"]} {short_input(blk["name"], blk.get("input", {}))}'.strip()
+                if blk["name"] == "Skill":
+                    a.skills.append(blk.get("input", {}).get("skill", "?"))
+                self._tool(ts, f"agent:{a.id[:6]}", blk["name"], blk.get("input", {}), blk.get("id"))
+
+
+def bar(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    n = int(round(frac * width))
+    color = GREEN if frac < 0.5 else YELLOW if frac < 0.8 else RED
+    return c(color, "█" * n) + c(DIM, "░" * (width - n))
+
+
+def render(s, limit):
+    if not limit:  # auto: a session past 200k must be running with the 1M window
+        limit = 1_000_000 if s.peak > 200_000 else 200_000
+    cols = shutil.get_terminal_size((100, 40)).columns
+    w = max(60, min(cols, 120))
+    L = []
+    hr = c(DIM, "─" * w)
+    L.append(c(BOLD, f"CLAUDE X-RAY") + c(DIM, f"  sessão {s.id[:8]}  ·  {s.path.parent.name[:50]}  ·  {datetime.now():%H:%M:%S}"))
+    if s.last_prompt:
+        L.append(c(DIM, "último pedido: ") + s.last_prompt[: w - 16])
+    L.append(hr)
+
+    # context
+    frac = s.context / limit if limit else 0
+    L.append(c(BOLD, "CONTEXTO ") + f"{fmt_tok(s.context)} / {fmt_tok(limit)}  ({frac:.0%})  "
+             + c(DIM, f"pico {fmt_tok(s.peak)} · saída total {fmt_tok(s.out_tokens)} · compactações {s.compactions} · modelo {s.model or '?'}"))
+    L.append("  " + bar(frac, w - 4))
+    L.append(hr)
+
+    # agents
+    running = [a for a in s.agents.values() if not a.finished]
+    done = [a for a in s.agents.values() if a.finished]
+    L.append(c(BOLD, "AGENTES ") + f"chamados {s.agent_calls}  ·  "
+             + c(YELLOW, f"rodando {len(running)}") + "  ·  " + c(GREEN, f"terminados {len(done)}"))
+    show = sorted(running, key=lambda a: a.start, reverse=True) + sorted(done, key=lambda a: a.start, reverse=True)
+    for a in show[:8]:
+        st = c(YELLOW, "● rodando ") if not a.finished else c(GREEN, "✓ pronto  ")
+        sk = c(MAGENTA, " skills:" + ",".join(dict.fromkeys(a.skills))) if a.skills else ""
+        line = f"  {st} {a.desc[:34]:34} {c(DIM, (a.type or '')[:16]):16} ctx {fmt_tok(a.context):>6}  tools {a.tools:>3}  {c(DIM, a.last_tool[:30])}{sk}"
+        L.append(line)
+    if len(show) > 8:
+        L.append(c(DIM, f"  … e mais {len(show) - 8}"))
+    L.append(hr)
+
+    # skills
+    L.append(c(BOLD, "SKILLS ") + f"disponíveis {s.skills_available}  ·  invocadas {len(s.skill_calls)}"
+             + (f"  ·  novas na sessão {len(s.skills_added)}" if s.skills_added else ""))
+    for ts, who, name, how, *_ in s.skill_calls[-6:]:
+        L.append(f"  {c(DIM, hhmm(ts))}  {c(MAGENTA, name):40} {c(DIM, how)}  {c(DIM, who)}")
+    for ts, name in s.skills_added[-3:]:
+        L.append(f"  {c(DIM, hhmm(ts))}  {c(CYAN, '+ ' + name)}  {c(DIM, 'adicionada à lista')}")
+    if s.skill_reads:
+        reads = "  ·  ".join(f"{k}: {', '.join(sorted(v))}" for k, v in list(s.skill_reads.items())[-3:])
+        L.append(c(DIM, "  arquivos de skill lidos → ") + reads[: w - 28])
+    L.append(hr)
+
+    # feed
+    L.append(c(BOLD, "ATIVIDADE RECENTE"))
+    for ts, who, name, detail, *_ in sorted(s.feed, key=lambda x: x[0])[-10:]:
+        whoc = c(CYAN, f"{who:12}") if who != "main" else c(DIM, f"{who:12}")
+        L.append(f"  {c(DIM, hhmm(ts))}  {whoc} {c(BOLD, f'{name[:10]:10}')} {detail[: w - 38]}")
+    return "\n".join(L)
+
+
+def last_prompt_of(f, tail_bytes=400_000):
+    """Last real user prompt, scanning only the end of the file."""
+    try:
+        with open(f, "rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - tail_bytes))
+            lines = fh.read().decode("utf-8", "replace").split("\n")
+    except OSError:
+        return ""
+    for l in reversed(lines):
+        if '"type":"user"' not in l:
+            continue
+        try:
+            e = json.loads(l)
+        except Exception:
+            continue
+        content = e.get("message", {}).get("content")
+        if isinstance(content, list):
+            content = next((b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"), "")
+        if isinstance(content, str) and content.strip() and not content.startswith("<"):
+            return content.strip().replace("\n", " ")
+    return ""
+
+
+def list_sessions(all_projects, cwd, n):
+    dirs = [d for d in PROJECTS.iterdir() if d.is_dir()] if all_projects else [project_dir_for(cwd)]
+    return sorted((f for d in dirs if d.exists() for f in d.glob("*.jsonl")),
+                  key=lambda f: f.stat().st_mtime, reverse=True)[:n]
+
+
+def resolve_session(arg):
+    p = Path(arg)
+    if p.exists():
+        return p
+    hits = list(PROJECTS.glob(f"*/{arg}*.jsonl"))
+    return hits[0] if hits else None
+
+
+# ---------------------------------------------------------------- Textual UI
+from rich.console import Group
+from rich.rule import Rule
+from rich.syntax import Syntax
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Label, Sparkline, Static
+
+AUTO = "__auto__"
+
+
+def kv(*pairs):
+    """Aligned 'label  value' lines."""
+    t = Text()
+    for k, v in pairs:
+        t.append(f"{k:>14}  ", style="dim")
+        t.append(v if isinstance(v, Text) else Text(str(v)))
+        t.append("\n")
+    return t
+
+
+def code(text, lexer):
+    return Syntax(text, lexer, theme="monokai", word_wrap=True, background_color="default")
+
+
+def result_block(s, tid):
+    if not tid or tid not in s.results:
+        return Text("(sem resultado ainda)", style="dim italic")
+    ts, text, err = s.results[tid]
+    head = Text(f"{hhmm(ts)}  ", style="dim") + (Text("ERRO", style="bold red") if err else Text("ok", style="green"))
+    return Group(head, Text(text or "(vazio)", style="red" if err else ""))
+
+
+class Detail(ModalScreen):
+    """Scrollable read-only dialog."""
+    BINDINGS = [("escape", "close", "fechar"), ("q", "close", "fechar")]
+
+    def __init__(self, title, body):
+        super().__init__()
+        self.box_title, self.body = title, body
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="detail", classes="dialog") as v:
+            v.border_title = self.box_title
+            v.border_subtitle = "Esc fecha · ↑↓ PgUp PgDn rolam"
+            yield Static(self.body)
+
+    def on_mount(self):
+        self.query_one("#detail").focus()
+
+    def action_close(self):
+        self.dismiss()
+
+
+class ContextDetail(ModalScreen):
+    BINDINGS = [("escape", "close", "fechar"), ("q", "close", "fechar")]
+
+    def __init__(self, s, limit):
+        super().__init__()
+        self.s, self.limit = s, limit
+
+    def compose(self) -> ComposeResult:
+        s, h = self.s, self.s.ctx_hist
+        with Vertical(id="ctxdialog", classes="dialog") as v:
+            v.border_title = f"Contexto · sessão {s.id[:8]}"
+            v.border_subtitle = "Esc fecha · ↑↓ navega"
+            last = h[-1] if h else None
+            frac = s.context / self.limit if self.limit else 0
+            yield Static(kv(
+                ("atual", Text(f"{s.context:,} tokens  ({frac:.1%} de {fmt_tok(self.limit)})", style="bold")),
+                ("restante", f"{max(0, self.limit - s.context):,} tokens"),
+                ("pico", f"{s.peak:,}"),
+                ("última chamada", f"input {last[2]:,} · cache lido {last[3]:,} · cache criado {last[4]:,} · saída {last[5]:,}"
+                 if last else "—"),
+                ("saída total", f"{s.out_tokens:,} tokens em {len(h)} respostas"),
+                ("compactações", ", ".join(hhmm(t) for t in s.compact_ts) or "nenhuma"),
+                ("modelo", s.model or "?"),
+            ))
+            yield Label(Text("evolução do contexto (uma barra por resposta do modelo)", style="dim"))
+            yield Sparkline([r[1] for r in h] or [0], id="spark")
+            yield DataTable(id="ctxtable", cursor_type="row", zebra_stripes=True)
+
+    def on_mount(self):
+        t = self.query_one("#ctxtable", DataTable)
+        t.add_columns("hora", "contexto", "Δ", "input", "cache lido", "cache criado", "saída", "pedido do turno")
+        prev = 0
+        rows = []
+        for ts, ctx, inp, cr, cn, out, prompt, _ in self.s.ctx_hist:
+            d = ctx - prev
+            prev = ctx
+            dt = Text(f"{'+' if d >= 0 else ''}{fmt_tok(abs(d)) if d >= 0 else '-' + fmt_tok(-d)}",
+                      style="red" if d > 20_000 else "yellow" if d > 5_000 else "green" if d < 0 else "dim")
+            rows.append((hhmm(ts), fmt_tok(ctx), dt, fmt_tok(inp), fmt_tok(cr), fmt_tok(cn), fmt_tok(out),
+                         Text(prompt[:70], style="dim")))
+        for r in reversed(rows):
+            t.add_row(*r)
+        t.focus()
+
+    def action_close(self):
+        self.dismiss()
+
+
+class Picker(ModalScreen):
+    """Lists recent sessions. Dismisses with a Path, AUTO (follow newest) or None (cancel)."""
+    BINDINGS = [("escape", "cancel", "voltar"), ("a", "toggle_all", "todos os projetos")]
+
+    def __init__(self, app_args, can_cancel):
+        super().__init__()
+        self.args, self.can_cancel = app_args, can_cancel
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker", classes="dialog"):
+            yield DataTable(id="ptable", cursor_type="row", zebra_stripes=True)
+            yield Label(Text("Enter abre · a alterna projeto atual/todos · Esc volta", style="dim"))
+
+    def on_mount(self):
+        self.load()
+
+    def load(self):
+        box = self.query_one("#picker")
+        box.border_title = "Sessões recentes · " + ("todos os projetos" if self.args.all else "projeto atual")
+        t = self.query_one(DataTable)
+        t.clear(columns=True)
+        cols = ["quando", "sessão"] + (["projeto"] if self.args.all else []) + ["último pedido"]
+        t.add_columns(*cols)
+        auto = [Text("⟳ seguir a mais recente", style="bold cyan"), Text("auto", style="dim")]
+        auto += [""] * (len(cols) - len(auto) - 1) + [Text("troca sozinho após /clear", style="dim")]
+        t.add_row(*auto, key=AUTO)
+        for f in list_sessions(self.args.all, self.args.cwd, self.args.list):
+            row = [datetime.fromtimestamp(f.stat().st_mtime).strftime("%d/%m %H:%M"), f.stem[:8]]
+            if self.args.all:
+                row.append(f.parent.name[-30:])
+            row.append(Text(last_prompt_of(f)[:90] or "(sem pedidos)"))
+            t.add_row(*row, key=str(f))
+        t.focus()
+
+    def on_data_table_row_selected(self, ev: DataTable.RowSelected):
+        ev.stop()
+        k = ev.row_key.value
+        self.dismiss(AUTO if k == AUTO else Path(k))
+
+    def action_toggle_all(self):
+        self.args.all = not self.args.all
+        self.load()
+
+    def action_cancel(self):
+        if self.can_cancel:
+            self.dismiss(None)
+        else:
+            self.app.exit()
+
+
+class XRay(App):
+    TITLE = "Claude X-Ray"
+    CSS = """
+    #prompt, #ctx, #ctxbar { height: 1; padding: 0 1; }
+    #ctx:hover, #ctxbar:hover { background: $boost; }
+    #ctxbar { margin-bottom: 1; }
+    #mid { height: 13; }
+    .box { border: round $primary-darken-2; border-title-color: $text; border-title-style: bold; }
+    .box:focus-within { border: round $accent; }
+    #agentsbox { width: 3fr; }
+    #skillsbox { width: 2fr; }
+    #feedbox { height: 1fr; }
+    DataTable { height: 1fr; }
+    Picker, Detail, ContextDetail { align: center middle; }
+    .dialog { width: 92%; height: 88%; border: thick $accent; background: $surface; padding: 0 1;
+              border-title-style: bold; border-subtitle-color: $text-muted; }
+    #spark { height: 4; margin-bottom: 1; }
+    """
+    BINDINGS = [("q", "quit", "sair"), ("s", "pick", "sessões"), ("c", "context", "contexto"),
+                ("1", "focus('agents')", "agentes"), ("2", "focus('skills')", "skills"),
+                ("3", "focus('feed')", "atividade"), ("p", "pause", "pausar")]
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.session, self.follow, self.paused, self._sig = None, False, False, None
+        self.rows = {}   # row key -> payload for the detail dialogs
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static(id="prompt")
+        yield Static(id="ctx")
+        yield Static(id="ctxbar")
+        with Horizontal(id="mid"):
+            with Vertical(classes="box", id="agentsbox"):
+                yield DataTable(id="agents", cursor_type="row", zebra_stripes=True)
+            with Vertical(classes="box", id="skillsbox"):
+                yield DataTable(id="skills", cursor_type="row", zebra_stripes=True)
+        with Vertical(classes="box", id="feedbox"):
+            yield DataTable(id="feed", cursor_type="row", zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self):
+        self.query_one("#agents", DataTable).add_columns("", "descrição", "tipo", "ctx", "tools", "última ferramenta", "skills")
+        self.query_one("#skills", DataTable).add_columns("hora", "skill", "como", "quem")
+        self.query_one("#feed", DataTable).add_columns("hora", "quem", "ferramenta", "detalhe", "")
+        self.query_one("#feedbox").border_title = "Atividade recente · Enter abre detalhes"
+        self.query_one("#feed").focus()
+        if self.args.session:
+            path = resolve_session(self.args.session)
+            if not path:
+                self.exit(message=f"Sessão {self.args.session} não encontrada.")
+                return
+            self.open(path)
+        elif self.args.latest:
+            self.follow = True
+            self.open_newest()
+        else:
+            self.push_screen(Picker(self.args, can_cancel=False), self.picked)
+        self.set_interval(self.args.interval, self.tick)
+
+    # ---- session handling ------------------------------------------------
+    def picked(self, result):
+        if result is None:
+            return
+        if result == AUTO:
+            self.follow = True
+            self.open_newest()
+        else:
+            self.follow = False
+            self.open(result)
+
+    def open_newest(self):
+        path = newest_session(self.args.all, self.args.cwd)
+        if path:
+            self.open(path)
+        else:
+            self.session = None
+            self.sub_title = "aguardando uma sessão…"
+
+    def open(self, path):
+        self.session = Session(path)
+        self.session.update()
+        self._sig = None
+        self.refresh_view()
+
+    def tick(self):
+        if self.paused:
+            return
+        if self.follow:
+            newest = newest_session(self.args.all, self.args.cwd)
+            cur = self.session.path if self.session else None
+            if newest and newest != cur and (cur is None or born(newest) > born(cur)
+                                             or newest.stat().st_mtime > cur.stat().st_mtime + 2):
+                self.open(newest)
+                self.notify(f"Seguindo nova sessão {newest.stem[:8]}")
+                return
+        if self.session:
+            self.session.update()
+            self.refresh_view()
+
+    # ---- actions -----------------------------------------------------------
+    def action_pick(self):
+        self.push_screen(Picker(self.args, can_cancel=True), self.picked)
+
+    def action_pause(self):
+        self.paused = not self.paused
+        self.notify("Pausado" if self.paused else "Retomado")
+
+    def action_focus(self, wid):
+        self.query_one(f"#{wid}").focus()
+
+    def limit(self):
+        return self.args.limit or (1_000_000 if self.session.peak > 200_000 else 200_000)
+
+    def action_context(self):
+        if self.session:
+            self.push_screen(ContextDetail(self.session, self.limit()))
+
+    def on_click(self, ev):
+        if ev.widget is not None and ev.widget.id in ("ctx", "ctxbar"):
+            self.action_context()
+
+    def on_data_table_row_selected(self, ev: DataTable.RowSelected):
+        payload = self.rows.get(ev.row_key.value)
+        if not payload or not self.session:
+            return
+        kind, data = payload
+        title, body = getattr(self, f"detail_{kind}")(data)
+        self.push_screen(Detail(title, body))
+
+    # ---- detail builders -----------------------------------------------------
+    def detail_feed(self, entry):
+        s = self.session
+        ts, who, name, short, tid, inp = entry
+        parts = [kv(("quando", hhmm(ts)), ("quem", who), ("ferramenta", Text(name, style="bold")),
+                    ("resumo", short), ("id", tid or "—")),
+                 Rule("entrada", style="dim")]
+        if name == "Bash" and inp.get("command"):
+            parts.append(code(inp["command"], "bash"))
+            rest = {k: v for k, v in inp.items() if k != "command"}
+            if rest:
+                parts.append(code(json.dumps(rest, indent=2, ensure_ascii=False), "json"))
+        else:
+            parts.append(code(json.dumps(inp, indent=2, ensure_ascii=False), "json"))
+        parts += [Rule("resultado", style="dim"), result_block(s, tid)]
+        return f"{name} · {short[:60]}", Group(*parts)
+
+    def detail_skillcall(self, call):
+        s = self.session
+        ts, who, name, how, tid, args = call
+        parts = [kv(("skill", Text(name, style="bold magenta")), ("quando", hhmm(ts)), ("como", how),
+                    ("quem", who), ("argumentos", args or "—"))]
+        parts += self._skill_info(name)
+        if tid:
+            parts += [Rule("resultado da chamada", style="dim"), result_block(s, tid)]
+        return f"Skill · {name}", Group(*parts)
+
+    def detail_skillname(self, data):
+        name, note = data
+        return f"Skill · {name}", Group(kv(("skill", Text(name, style="bold magenta")), ("evento", note)),
+                                        *self._skill_info(name))
+
+    def _skill_info(self, name):
+        s = self.session
+        base = name.split(":")[-1]
+        reads = s.skill_reads.get(base) or s.skill_reads.get(name)
+        out = []
+        if reads:
+            out.append(kv(("arquivos lidos", ", ".join(sorted(reads)))))
+        md = find_skill_md(name, s.cwd or self.args.cwd)
+        if md:
+            text = md.read_text(errors="replace")
+            lines = text.splitlines()
+            out += [Rule(str(md).replace(str(Path.home()), "~"), style="dim"),
+                    code("\n".join(lines[:150]) + (f"\n\n… (+{len(lines) - 150} linhas)" if len(lines) > 150 else ""),
+                         "markdown")]
+        else:
+            out.append(Text("SKILL.md não encontrado localmente (skill embutida ou de plugin remoto).", style="dim italic"))
+        return out
+
+    def detail_agent(self, a):
+        s = self.session
+        tag = f"agent:{a.id[:6]}"
+        steps = [f for f in s.feed if f[1] == tag]
+        lines = Text()
+        for ts, _, name, short, tid, _ in steps:
+            err = s.results.get(tid, (0, 0, False))[2]
+            lines.append(f"{hhmm(ts)}  ", style="dim")
+            lines.append(f"{name:12}", style="bold red" if err else "bold")
+            lines.append(f"{short}\n")
+        return f"Agente · {a.desc[:60]}", Group(
+            kv(("descrição", a.desc), ("tipo", a.type or "—"), ("modelo", a.model or "—"),
+               ("estado", Text("pronto", style="green") if a.finished else Text("rodando", style="yellow")),
+               ("contexto", fmt_tok(a.context)), ("ferramentas", a.tools),
+               ("skills", ", ".join(dict.fromkeys(a.skills)) or "—"), ("id", a.id)),
+            Rule("ferramentas usadas (Enter na Atividade mostra cada uma)", style="dim"),
+            lines or Text("nenhuma ainda", style="dim"))
+
+    # ---- drawing -----------------------------------------------------------
+    def fill(self, tid, rows):
+        """Rebuild a table, keeping the cursor on the same item (or on top if it was there)."""
+        t = self.query_one(f"#{tid}", DataTable)
+        keep = None
+        if t.row_count and t.cursor_row > 0:
+            keep = t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value
+        t.clear()
+        for key, cells, payload in rows:
+            self.rows[key] = payload
+            t.add_row(*cells, key=key)
+        if keep is not None:
+            try:
+                t.move_cursor(row=t.get_row_index(keep), animate=False)
+            except Exception:
+                pass
+
+    def refresh_view(self):
+        s = self.session
+        limit = self.limit()
+        mode = "seguindo a mais recente" if self.follow else "sessão fixa"
+        self.sub_title = f"{s.id[:8]} · {s.path.parent.name[-40:]} · {mode}" + (" · PAUSADO" if self.paused else "")
+
+        self.query_one("#prompt", Static).update(
+            Text.assemble(("último pedido: ", "dim"), s.last_prompt or "—"))
+        frac = s.context / limit if limit else 0
+        color = "green" if frac < 0.5 else "yellow" if frac < 0.8 else "red"
+        self.query_one("#ctx", Static).update(Text.assemble(
+            ("Contexto ", "bold"), (f"{fmt_tok(s.context)} / {fmt_tok(limit)} ({frac:.0%})", f"bold {color}"),
+            (f"   pico {fmt_tok(s.peak)} · saída total {fmt_tok(s.out_tokens)} · "
+             f"compactações {s.compactions} · modelo {s.model or '?'}   ", "dim"), ("[c] detalhes", "dim italic")))
+        barw = max(10, self.query_one("#ctxbar").size.width - 2)
+        n = int(round(max(0.0, min(1.0, frac)) * barw))
+        self.query_one("#ctxbar", Static).update(
+            Text.assemble(("█" * n, color), ("░" * (barw - n), "grey37")))
+
+        running = [a for a in s.agents.values() if not a.finished]
+        done = [a for a in s.agents.values() if a.finished]
+        self.query_one("#agentsbox").border_title = (
+            f"[1] Agentes · chamados {s.agent_calls} · rodando {len(running)} · terminados {len(done)}")
+        self.query_one("#skillsbox").border_title = (
+            f"[2] Skills · disponíveis {s.skills_available} · invocadas {len(s.skill_calls)}"
+            + (f" · novas {len(s.skills_added)}" if s.skills_added else ""))
+        self.query_one("#feedbox").border_title = "[3] Atividade recente · Enter abre detalhes"
+
+        sig = (s.id, s.agent_calls, tuple((a.id, a.finished, a.tools, a.context, a.desc) for a in s.agents.values()),
+               len(s.skill_calls), len(s.skills_added), sum(map(len, s.skill_reads.values())),
+               len(s.feed), s.feed[-1][:5] if s.feed else None, len(s.results))
+        if sig == self._sig:
+            return
+        self._sig = sig
+        self.rows = {}
+
+        show = sorted(running, key=lambda a: a.start, reverse=True) + sorted(done, key=lambda a: a.start, reverse=True)
+        self.fill("agents", [
+            (f"ag:{a.id}",
+             (Text("● rodando", style="bold yellow") if not a.finished else Text("✓ pronto", style="green"),
+              Text(a.desc[:40]), Text(a.type, style="dim"), fmt_tok(a.context), str(a.tools),
+              Text(a.last_tool[:40], style="dim"), Text(",".join(dict.fromkeys(a.skills)), style="magenta")),
+             ("agent", a)) for a in show])
+
+        rows = []
+        for i, call in reversed(list(enumerate(s.skill_calls))):
+            ts, who, name, how = call[:4]
+            rows.append((f"sc:{i}", (hhmm(ts), Text(name, style="magenta"), Text(how, style="dim"), Text(who, style="dim")),
+                         ("skillcall", call)))
+        for i, (ts, name) in reversed(list(enumerate(s.skills_added))):
+            rows.append((f"sa:{i}", (hhmm(ts), Text("+ " + name, style="cyan"), Text("adicionada", style="dim"), ""),
+                         ("skillname", (name, f"adicionada à lista às {hhmm(ts)}"))))
+        for k, v in s.skill_reads.items():
+            rows.append((f"sr:{k}", ("", Text(k, style="magenta"), Text("leu " + ", ".join(sorted(v)), style="dim"), ""),
+                         ("skillname", (k, "arquivos da skill lidos"))))
+        self.fill("skills", rows)
+
+        rows = []
+        for i, entry in enumerate(sorted(s.feed, key=lambda x: x[0], reverse=True)[:200]):
+            ts, who, name, detail, tid, _ = entry
+            res = s.results.get(tid)
+            st = Text("…", style="yellow") if res is None else Text("✗", style="bold red") if res[2] else Text("✓", style="green")
+            rows.append((f"fd:{tid or ts + name + str(i)}",
+                         (hhmm(ts), Text(who, style="dim" if who == "main" else "cyan"), Text(name, style="bold"),
+                          Text(detail[:120]), st), ("feed", entry)))
+        self.fill("feed", rows)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Live X-ray of a Claude Code session.")
+    ap.add_argument("--session", help="session id (or path to the .jsonl)")
+    ap.add_argument("--all", action="store_true", help="list/follow sessions of every project")
+    ap.add_argument("--cwd", default=os.getcwd(), help="project directory (default: current directory)")
+    ap.add_argument("--limit", type=int, default=0, help="context window for the %% bar (default: auto, 200k or 1M)")
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--once", action="store_true", help="print one plain-text snapshot and exit")
+    ap.add_argument("--latest", "-l", action="store_true", help="skip the menu and follow the newest session")
+    ap.add_argument("--list", type=int, default=15, help="how many sessions the menu shows (default 15)")
+    args = ap.parse_args()
+
+    if args.once or not sys.stdout.isatty():
+        path = resolve_session(args.session) if args.session else newest_session(args.all, args.cwd)
+        if not path:
+            sys.exit("Nenhuma sessão encontrada. Use --all ou --session ID.")
+        s = Session(path)
+        s.update()
+        print(render(s, args.limit))
+        return
+    XRay(args).run()
+
+
+if __name__ == "__main__":
+    main()
