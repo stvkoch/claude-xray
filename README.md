@@ -1,8 +1,16 @@
-# claude-xray
+# claude-xray (Agent X-Ray)
 
-Live X-ray of a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) session in your terminal, built with [Textual](https://github.com/Textualize/textual).
+Live X-ray of AI coding agent sessions in your terminal, built with [Textual](https://github.com/Textualize/textual).
 
-It tails the transcript Claude Code writes to `~/.claude/projects/` and shows, refreshing every second:
+Supports **Claude Code**, **OpenAI Codex**, **Cursor**, and **AGY** (Google Antigravity / Gemini CLI).
+
+It tails session transcripts from:
+- `~/.claude/projects/` (Claude Code)
+- `~/.codex/sessions/` (OpenAI Codex CLI)
+- `~/.cursor/projects/*/agent-transcripts/` (Cursor)
+- `~/.gemini/antigravity/brain/` (AGY / Gemini CLI)
+
+and shows, refreshing every second:
 
 - **Context**: current size, peak, total output, compactions, with a per-response history and sparkline
   - **Inside the context** (`d` in the context dialog, or Enter on a row of its history): what was actually sent to the model, rebuilt from the request log Claude Code writes. Shows the system prompt, every tool definition, and each reminder, prompt, reply, thinking block, tool call and tool result, broken down by category and sorted by size. Enter opens any item in full. The token split is estimated from character counts and scaled to the real total the API reported
@@ -37,13 +45,14 @@ Update with `uv tool upgrade claude-xray`, remove with `uv tool uninstall claude
 
 ## Usage
 
-Run it in a second terminal, from the same directory as your Claude Code session:
+Run it in a second terminal, from the same directory as your agent session:
 
 ```sh
 claude-xray                 # pick a session from a list
-claude-xray --latest        # follow the newest session, switching after /clear
+claude-xray --agent codex   # filter to Codex sessions (or cursor, agy, claude)
+claude-xray --latest        # follow the newest session
 claude-xray --all           # list/follow sessions of every project
-claude-xray --session ID    # open a specific session id
+claude-xray --session ID    # open a specific session id across any supported agent
 claude-xray --once          # print a plain-text snapshot and exit
 claude-xray --headless      # also list headless `claude -p` / SDK runs (hidden by default)
 claude-xray --cwd DIR       # sessions of another project directory (default: current directory)
@@ -68,6 +77,7 @@ claude-xray --limit 1000000 # context window for the % bar (default: from the mo
 | `s` | switch session |
 | `a` / `h` | in the session list: all projects / show headless `claude -p` runs |
 | `p` | pause refresh |
+| `r` | reload session from disk (hard refresh) |
 | `Esc` | close dialog |
 | `q` | quit |
 

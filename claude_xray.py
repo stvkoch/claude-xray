@@ -25,6 +25,75 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECTS = Path.home() / ".claude" / "projects"
+CLAUDE_PROJECTS = PROJECTS
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+CURSOR_PROJECTS = Path.home() / ".cursor" / "projects"
+AGY_BRAIN = Path.home() / ".gemini" / "antigravity" / "brain"
+GEMINI_HISTORY = Path.home() / ".gemini" / "history"
+
+_CWD_CACHE = {}
+
+def project_matches(cwd, target_cwd):
+    if not target_cwd or not cwd:
+        return True
+    try:
+        p1, p2 = Path(cwd).resolve(), Path(target_cwd).resolve()
+        return p1 == p2 or p1 in p2.parents or p2 in p1.parents
+    except Exception:
+        return str(cwd).lower() in str(target_cwd).lower() or str(target_cwd).lower() in str(cwd).lower()
+
+def detect_agent_type(path):
+    p = str(path)
+    if "/.codex/" in p or Path(path).name.startswith("rollout-"):
+        return "codex"
+    if "/.cursor/" in p:
+        return "cursor"
+    if "/.gemini/" in p or "antigravity" in p or Path(path).name == "transcript.jsonl":
+        return "agy"
+    return "claude"
+
+def codex_session_cwd(path):
+    if path in _CWD_CACHE:
+        return _CWD_CACHE[path]
+    cwd = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 30: break
+                if '"session_meta"' in line or '"turn_context"' in line:
+                    d = json.loads(line)
+                    cwd = d.get("payload", {}).get("cwd")
+                    if cwd: break
+    except Exception:
+        pass
+    _CWD_CACHE[path] = cwd
+    return cwd
+
+def cursor_slug(path):
+    """Cursor's project folder name for a path: strip leading /, then / and . become -."""
+    return str(Path(path).resolve()).lstrip("/").replace("/", "-").replace(".", "-")
+
+def cursor_project_matches(pdir, target_cwd):
+    """Match a ~/.cursor/projects/<slug> dir to cwd. Decoding the slug is lossy
+    (dots and slashes both become -), so encode cwd (and its parents) instead."""
+    if not target_cwd:
+        return True
+    name = Path(pdir).name
+    try:
+        target = Path(target_cwd).resolve()
+    except Exception:
+        return False
+    for p in [target, *target.parents]:
+        if name == cursor_slug(p):
+            return True
+        if p.parent == p:  # filesystem root
+            break
+    return False
+
+def session_agent_label(path):
+    t = detect_agent_type(path)
+    return {"claude": "claude", "codex": "codex", "cursor": "cursor", "agy": "agy"}.get(t, t)
+
 NO_COLOR = not sys.stdout.isatty() or os.environ.get("NO_COLOR")
 
 def c(code, s):
@@ -36,11 +105,35 @@ def fmt_tok(n):
     if n >= 1000: return f"{n/1000:.1f}k"
     return str(n)
 
-def hhmm(ts):
+def parse_ts(ts):
+    """Parse ISO or Cursor 'Wednesday, Nov 18, 2026, 5:39 PM (UTC)' timestamps."""
+    if not ts or not isinstance(ts, str):
+        return None
+    s = ts.strip()
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M:%S")
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
+        pass
+    try:
+        base = re.sub(r"\s*\([^)]*\)\s*$", "", s)
+        return datetime.strptime(base, "%A, %b %d, %Y, %I:%M %p")
+    except Exception:
+        return None
+
+def ts_sort_key(ts):
+    return parse_ts(ts) or datetime.min
+
+def hhmm(ts):
+    dt = parse_ts(ts)
+    if not dt:
         return "--:--:--"
+    try:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+    except Exception:
+        pass
+    # full date+time so the activity column is readable (Cursor stamps are often minute-only)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 def project_dir_for(cwd):
     return PROJECTS / re.sub(r"[/.]", "-", str(cwd))
@@ -70,14 +163,45 @@ def is_headless(f):
     return _ENTRYPOINTS[f]
 
 
-def session_files(all_projects, cwd, headless=False):
-    dirs = [d for d in PROJECTS.iterdir() if d.is_dir()] if all_projects else [project_dir_for(cwd)]
-    files = (f for d in dirs if d.exists() for f in d.glob("*.jsonl"))
-    return [f for f in files if headless or not is_headless(f)]
+def session_files(all_projects, cwd, headless=False, agent="auto"):
+    files = []
+    # Claude
+    if agent in ("auto", "claude") and CLAUDE_PROJECTS.exists():
+        dirs = [d for d in CLAUDE_PROJECTS.iterdir() if d.is_dir()] if all_projects else [project_dir_for(cwd)]
+        claude_f = [f for d in dirs if d.exists() for f in d.glob("*.jsonl")]
+        files.extend([f for f in claude_f if headless or not is_headless(f)])
+
+    # Codex
+    if agent in ("auto", "codex") and CODEX_SESSIONS.exists():
+        for f in CODEX_SESSIONS.glob("*/*/*/*.jsonl"):
+            if all_projects or project_matches(codex_session_cwd(f), cwd):
+                files.append(f)
+
+    # Cursor
+    if agent in ("auto", "cursor") and CURSOR_PROJECTS.exists():
+        for pdir in CURSOR_PROJECTS.iterdir():
+            if not pdir.is_dir(): continue
+            if all_projects or cursor_project_matches(pdir, cwd):
+                files.extend(pdir.glob("agent-transcripts/*/*.jsonl"))
+
+    # AGY (Antigravity / Gemini)
+    if agent in ("auto", "agy"):
+        if AGY_BRAIN.exists():
+            for f in AGY_BRAIN.glob("*/.system_generated/logs/transcript.jsonl"):
+                files.append(f)
+        try:
+            cur_agy = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+            if cur_agy.exists():
+                for f in cur_agy.glob("*/.system_generated/logs/transcript.jsonl"):
+                    files.append(f)
+        except Exception:
+            pass
+
+    return files
 
 
-def newest_session(all_projects, cwd, headless=False):
-    files = session_files(all_projects, cwd, headless)
+def newest_session(all_projects, cwd, headless=False, agent="auto"):
+    files = session_files(all_projects, cwd, headless, agent=agent)
     return max(files, key=lambda f: f.stat().st_mtime) if files else None
 
 def born(f):
@@ -90,11 +214,35 @@ def context_of(usage):
 
 def short_input(name, inp):
     if name == "Bash": return inp.get("description") or inp.get("command", "")[:60]
-    if name in ("Read", "Write", "Edit"): return Path(inp.get("file_path", "")).name
+    if name in ("Read", "Write", "Edit", "Delete"):
+        return Path(inp.get("file_path") or inp.get("path") or "").name
     if name == "Agent": return inp.get("description", "")
     if name == "Skill": return inp.get("skill", "")
-    if name in ("Grep", "Glob"): return inp.get("pattern", "")
+    if name in ("Grep", "Glob"): return inp.get("pattern") or inp.get("glob_pattern", "")
     return next((str(v)[:50] for v in inp.values() if isinstance(v, str)), "")
+
+
+def estimate_tokens(content):
+    """Rough token count from transcript content (chars/4). Cursor logs no usage."""
+    if isinstance(content, str):
+        return max(0, len(content) // 4)
+    if not isinstance(content, list):
+        return 0
+    n = 0
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            n += len(b.get("text") or "") // 4
+        elif t == "tool_use":
+            n += 8 + len(b.get("name") or "") // 4
+            n += len(json.dumps(b.get("input", {}), ensure_ascii=False)) // 4
+        elif t == "tool_result":
+            n += len(result_text(b.get("content"))) // 4
+        else:
+            n += len(json.dumps(b, ensure_ascii=False)) // 4
+    return n
 
 
 def result_text(content, cap=20_000):
@@ -107,13 +255,27 @@ def result_text(content, cap=20_000):
 
 def find_skill_md(name, cwd):
     base = name.split(":")[-1]
-    roots = [Path(cwd) / ".claude" / "skills"] if cwd else []
-    roots += [Path.home() / ".agents" / "skills", Path.home() / ".claude" / "skills"]
+    roots = []
+    if cwd:
+        roots.extend([Path(cwd) / ".claude" / "skills", Path(cwd) / ".cursor" / "skills", Path(cwd) / ".gemini" / "skills"])
+    roots += [
+        Path.home() / ".agents" / "skills",
+        Path.home() / ".claude" / "skills",
+        Path.home() / ".cursor" / "skills",
+        Path.home() / ".codex" / "skills",
+        Path.home() / ".gemini" / "skills",
+        Path.home() / ".gemini" / "antigravity-cli" / "builtin" / "skills"
+    ]
     for r in roots:
         if (r / base / "SKILL.md").exists():
             return r / base / "SKILL.md"
-    plug = Path.home() / ".claude" / "plugins"
-    return next(plug.glob(f"**/skills/{base}/SKILL.md"), None) if plug.exists() else None
+        for sub in (r / base).glob("**/SKILL.md") if (r / base).is_dir() else []:
+            return sub
+    for plug in [Path.home() / ".claude" / "plugins", Path.home() / ".gemini" / "config" / "plugins"]:
+        if plug.exists():
+            hit = next(plug.glob(f"**/skills/{base}/SKILL.md"), None) or next(plug.glob(f"**/{base}/SKILL.md"), None)
+            if hit: return hit
+    return None
 
 
 class Tail:
@@ -184,9 +346,19 @@ class Agent:
 class Session:
     def __init__(self, path):
         self.path = Path(path)
+        self.agent_type = detect_agent_type(self.path)
         self.id = self.path.stem
+        if self.agent_type == "agy" and self.path.name == "transcript.jsonl":
+            try: self.id = self.path.parents[2].name
+            except Exception: pass
         self.tail = Tail(path)
-        self.sub_dir = self.path.parent / self.id / "subagents"
+        if self.agent_type == "cursor":
+            self.sub_dir = self.path.parent / "subagents"
+        elif self.agent_type == "agy":
+            try: self.sub_dir = self.path.parents[1] / "subagents"
+            except Exception: self.sub_dir = self.path.parent / "subagents"
+        else:
+            self.sub_dir = self.path.parent / self.id / "subagents"
         self.agent_tails, self.agents = {}, {}
         self.context, self.peak, self.out_tokens, self.compactions = 0, 0, 0, 0
         self.turns, self.model = 0, ""
@@ -211,9 +383,19 @@ class Session:
         self.requests = []         # api-request entries, in order
         self.req_of_msg = {}       # assistant message id -> api-request id that produced it
         self._run = []             # transcript entries of the API message being assembled
+        self.cursor_msgs = []      # Cursor: [{role, content}, ...] as logged (no system/tools)
 
     # ---- main transcript -------------------------------------------------
     def update(self):
+        if self.agent_type == "codex":
+            self.update_codex()
+            return
+        elif self.agent_type == "cursor":
+            self.update_cursor()
+            return
+        elif self.agent_type == "agy":
+            self.update_agy()
+            return
         for e in self.tail.read():
             self._event(e, who="main")
         if self.sub_dir.exists():
@@ -235,6 +417,301 @@ class Session:
                     a.finished = bool(meta.get("finished", False))
                 except Exception:
                     pass
+
+
+    # ---- Codex adapter ---------------------------------------------------
+    def update_codex(self):
+        for e in self.tail.read():
+            self._event_codex(e, who="main")
+
+    def _event_codex(self, e, who="main"):
+        t = e.get("type")
+        ts = e.get("timestamp", "")
+        p = e.get("payload", {})
+        if t == "session_meta":
+            self.id = p.get("id", self.id)
+            self.cwd = p.get("cwd", self.cwd)
+            src = p.get("source")
+            if isinstance(src, dict) and src.get("subagent"):
+                aid = self.id
+                a = self.agents.setdefault(aid, Agent(aid))
+                a.desc = f"Subagent: {src.get('subagent')}"
+                a.type = str(src.get("subagent"))
+                a.start = a.start or ts
+                self.agent_calls = max(self.agent_calls, len(self.agents))
+        elif t == "turn_context":
+            self.cwd = p.get("cwd", self.cwd)
+            self.model = p.get("model", self.model)
+        elif t == "event_msg":
+            pt = p.get("type")
+            if pt == "user_message":
+                text = p.get("message", "")
+                if is_real_prompt(text):
+                    self.turns += 1
+                    self.prompt_ts.append(ts)
+                    self.last_prompt = text.strip().replace("\n", " ")
+            elif pt == "token_count":
+                info = p.get("info")
+                if info:
+                    tot = info.get("total_token_usage", {})
+                    inp = tot.get("input_tokens", 0)
+                    out = tot.get("output_tokens", 0)
+                    cached = tot.get("cached_input_tokens", 0)
+                    self.context = inp
+                    self.peak = max(self.peak, self.context)
+                    self.out_tokens = out
+                    win = info.get("model_context_window")
+                    if win and win > 0:
+                        self.model = self.model or f"ctx-{win}"
+                    self.ctx_hist.append((ts, self.context, inp, cached, 0, out, self.last_prompt, None))
+        elif t == "response_item":
+            pt = p.get("type")
+            if pt == "message":
+                content = p.get("content", [])
+                role = p.get("role")
+                if role == "user":
+                    for c in content:
+                        if c.get("type") == "input_text":
+                            t_text = c.get("text", "")
+                            if is_real_prompt(t_text):
+                                self.turns += 1
+                                self.prompt_ts.append(ts)
+                                self.last_prompt = t_text.strip().replace("\n", " ")
+            elif pt == "function_call":
+                name = p.get("name", "tool")
+                call_id = p.get("call_id")
+                raw_args = p.get("arguments", {})
+                args = raw_args
+                if isinstance(raw_args, str):
+                    try: args = json.loads(raw_args)
+                    except Exception: args = {"arg": raw_args}
+                self._tool(ts, who, name, args, call_id)
+                self.main_out.append((ts, json.dumps(args, ensure_ascii=False)[:20000]))
+            elif pt == "function_call_output":
+                call_id = p.get("call_id")
+                out = str(p.get("output", ""))
+                self.results[call_id] = (ts, out[:20000], False)
+
+    # ---- Cursor adapter --------------------------------------------------
+    def update_cursor(self):
+        for e in self.tail.read():
+            self._event_cursor(e, who="main")
+        if self.sub_dir.exists():
+            for f in self.sub_dir.glob("*.jsonl"):
+                aid = f.stem
+                t = self.agent_tails.setdefault(aid, Tail(f))
+                a = self.agents.setdefault(aid, Agent(aid))
+                for e in t.read():
+                    self._agent_event_cursor(a, e)
+                # Cursor writes turn_ended (or leaves the file idle) instead of Claude's meta.finished
+                if not a.finished:
+                    try:
+                        age = time.time() - f.stat().st_mtime
+                    except Exception:
+                        age = 0
+                    if a.end or age > 3:
+                        a.finished = True
+
+    def _event_cursor(self, e, who="main"):
+        role = e.get("role")
+        m = e.get("message", {})
+        content = m.get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        ts = ""
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                match = re.search(r"<timestamp>(.*?)</timestamp>", c.get("text", ""))
+                if match:
+                    ts = match.group(1)
+                    break
+        if ts:
+            self._cursor_last_ts = ts
+        else:
+            ts = getattr(self, "_cursor_last_ts", None) or datetime.fromtimestamp(self.path.stat().st_mtime).isoformat()
+
+        # Cursor transcripts have no API usage; estimate from logged content.
+        approx = estimate_tokens(content)
+        self.context += approx
+        self.peak = max(self.peak, self.context)
+        if role in ("user", "assistant"):
+            self.cursor_msgs.append({"role": role, "content": content})
+
+        if role == "user":
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = c.get("text", "")
+                    # Cursor attaches skills inline (no Skill tool / skill_listing events).
+                    if "<manually_attached_skills>" in text:
+                        for name in re.findall(r"Skill Name:\s*([^\n<]+)", text):
+                            name = name.strip()
+                            if name and not any(sc[2] == name and sc[3] == "attached" for sc in self.skill_calls):
+                                self.skill_calls.append((ts, who, name, "attached", None, ""))
+                        for m in re.finditer(r"Path:\s*([^\n]+/skills/(?:[^/\s]+/)*?([^/\s]+)/(SKILL\.md))", text):
+                            self.skill_reads.setdefault(m.group(2), set()).add(Path(m.group(3)).name)
+                    q = re.search(r"<user_query>(.*?)</user_query>", text, re.S)
+                    prompt_text = q.group(1).strip() if q else text.strip()
+                    # /task-manager style slash skills (not filesystem paths like /Users/...)
+                    for name in re.findall(r"(?m)^/([\w-]+)(?=\s|$)", prompt_text):
+                        if name.lower() in ("clear", "compact", "help", "model", "cost", "users", "home", "tmp", "var", "etc"):
+                            continue
+                        if not any(sc[2] == name and sc[3] == "/command" for sc in self.skill_calls):
+                            self.skill_calls.append((ts, who, name, "/command", None, ""))
+                    if is_real_prompt(prompt_text):
+                        self.turns += 1
+                        self.prompt_ts.append(ts)
+                        self.last_prompt = prompt_text.replace("\n", " ")
+        elif role == "assistant":
+            out_approx = 0
+            for c in content:
+                if not isinstance(c, dict): continue
+                ctype = c.get("type")
+                if ctype == "tool_use":
+                    name = c.get("name", "tool")
+                    inp = c.get("input", {})
+                    cid = c.get("id") or f"cur_{len(self.feed)}"
+                    self._tool(ts, who, name, inp, cid)
+                    self.main_out.append((ts, json.dumps(inp, ensure_ascii=False)[:20000]))
+                    out_approx += estimate_tokens([c])
+                    if name in ("Task", "Agent", "subagent"):
+                        self.agent_calls += 1
+                        aid = str(cid)
+                        a = self.agents.setdefault(aid, Agent(aid))
+                        a.desc = short_input(name, inp)
+                        a.type = name
+                        a.start = a.start or ts
+                elif ctype == "text" and c.get("text"):
+                    txt = c.get("text")
+                    self.main_out.append((ts, txt[:20000]))
+                    out_approx += len(txt) // 4
+            self.out_tokens += out_approx
+            # mid = how many transcript msgs were in context after this round-trip
+            mid = f"cursor:{len(self.cursor_msgs)}"
+            self.req_of_msg[mid] = mid
+            self.requests.append({
+                "id": mid, "timestamp": ts, "querySource": "cursor-approx",
+                "_upto": len(self.cursor_msgs), "_ctx": self.context,
+            })
+            self.ctx_hist.append((ts, self.context, self.context, 0, 0, out_approx,
+                                  self.last_prompt, mid))
+
+    def _agent_event_cursor(self, a, e):
+        # Cursor ends subagents with {type: turn_ended, status: ...} (no role)
+        if e.get("type") == "turn_ended" or e.get("status") in ("aborted", "completed", "error"):
+            a.finished = True
+            a.end = a.end or getattr(self, "_cursor_last_ts", "") or datetime.now().isoformat()
+            if e.get("error") and not a.report:
+                a.report = str(e.get("error"))
+            return
+        role = e.get("role")
+        m = e.get("message", {})
+        content = m.get("content", [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        ts = ""
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                match = re.search(r"<timestamp>(.*?)</timestamp>", c.get("text", ""))
+                if match:
+                    ts = match.group(1)
+                    break
+        if not ts:
+            # Subagent transcripts rarely include timestamps; inherit parent or file mtime.
+            ts = getattr(self, "_cursor_last_ts", None) or ""
+            if not ts:
+                try:
+                    ts = datetime.fromtimestamp(self.agent_tails[a.id].path.stat().st_mtime).isoformat()
+                except Exception:
+                    ts = datetime.fromtimestamp(self.path.stat().st_mtime).isoformat()
+            a.start = a.start or ts
+        else:
+            self._cursor_last_ts = ts
+            a.start = a.start or ts
+        if role == "user":
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text = c.get("text", "")
+                    if not a.brief:
+                        a.brief = text
+                        a.events.append((ts, "brief", text))
+                    else:
+                        a.events.append((ts, "note", text))
+                    # Attached skills inlined into the subagent brief (Cursor).
+                    for sk in re.findall(r"Skill Name:\s*([^\n<]+)", text):
+                        sk = sk.strip()
+                        if sk and sk not in a.skills:
+                            a.skills.append(sk)
+                            self.skill_calls.append((ts, f"agent:{a.id}", sk, "attached", None, ""))
+                    for m in re.finditer(r"/skills/(?:[^/\s]+/)*?([^/\s]+)/(SKILL\.md)", text):
+                        if m.group(1) not in a.skills:
+                            a.skills.append(m.group(1))
+                        self.skill_reads.setdefault(m.group(1), set()).add("SKILL.md")
+        elif role == "assistant":
+            for c in content:
+                if not isinstance(c, dict): continue
+                ctype = c.get("type")
+                if ctype == "text" and c.get("text"):
+                    a.report = c.get("text")
+                    a.events.append((ts, "text", a.report))
+                elif ctype == "tool_use":
+                    name = c.get("name", "tool")
+                    inp = c.get("input", {})
+                    # Cursor subagent tool_use often has no id; namespace by agent or keys collide in the feed.
+                    raw = c.get("id") or f"e{len(a.events)}"
+                    tid = raw if raw.startswith(a.id) else f"{a.id}:{raw}"
+                    a.tools += 1
+                    a.tool_names[tid] = name
+                    a.last_tool = f"{name} {short_input(name, inp)}".strip()
+                    a.events.append((ts, "tool", (name, short_input(name, inp), inp, tid)))
+                    self._tool(ts, f"agent:{a.id}", name, inp, tid)
+                    if name == "Skill":
+                        sk = inp.get("skill", "?")
+                        if sk not in a.skills:
+                            a.skills.append(sk)
+
+    # ---- AGY / Gemini adapter --------------------------------------------
+    def update_agy(self):
+        for e in self.tail.read():
+            self._event_agy(e, who="main")
+
+    def _event_agy(self, e, who="main"):
+        t = e.get("type")
+        ts = e.get("created_at", "")
+        if t == "USER_INPUT":
+            content = e.get("content", "")
+            if is_real_prompt(content):
+                self.turns += 1
+                self.prompt_ts.append(ts)
+                self.last_prompt = content.strip().replace("\n", " ")
+        elif t == "PLANNER_RESPONSE":
+            self.model = e.get("model", self.model)
+            in_tok = e.get("input_tokens")
+            out_tok = e.get("output_tokens")
+            if in_tok is not None:
+                self.context = in_tok
+                self.peak = max(self.peak, self.context)
+            if out_tok is not None:
+                self.out_tokens += out_tok
+            if in_tok is not None:
+                self.ctx_hist.append((ts, self.context, in_tok, e.get("cache_read_tokens", 0), 0, out_tok or 0, self.last_prompt, None))
+            for tc in e.get("tool_calls", []):
+                name = tc.get("name", "tool")
+                args = tc.get("args", {})
+                tid = f"agy_{len(self.feed)}"
+                self._tool(ts, who, name, args, tid)
+                self.main_out.append((ts, json.dumps(args, ensure_ascii=False)[:20000]))
+                if name in ("invoke_subagent", "swarm", "run_workflow"):
+                    self.agent_calls += 1
+                    aid = f"sub_{len(self.agents)+1}"
+                    a = self.agents.setdefault(aid, Agent(aid))
+                    a.desc = args.get("Role") or args.get("toolSummary") or name
+                    a.type = args.get("TypeName") or name
+                    a.start = a.start or ts
+        elif t in ("RUN_COMMAND", "VIEW_FILE", "EDIT_FILE", "WRITE_FILE", "GENERIC"):
+            content = str(e.get("content", ""))
+            if self.feed:
+                last_tid = self.feed[-1][4]
+                self.results[last_tid] = (ts, content[:20000], False)
 
     def _event(self, e, who):
         t = e.get("type")
@@ -336,6 +813,10 @@ class Session:
 
     def request_context(self, req):
         """(shape, messages) exactly as sent with this api-request. Unresolved messages are None."""
+        if req.get("querySource") == "cursor-approx":
+            # Cursor only logs chat turns — no system prompt or tool definitions.
+            upto = int(req.get("_upto") or len(self.cursor_msgs))
+            return {}, self.cursor_msgs[:upto]
         msgs = []
         src = req.get("querySource")
         for r in self.requests:
@@ -348,6 +829,15 @@ class Session:
 
     def request_for(self, msg_id=None):
         """The request behind an assistant message, or the latest main-thread request."""
+        if self.agent_type == "cursor":
+            if msg_id:
+                return next((r for r in self.requests if r.get("id") == msg_id), None)
+            if self.cursor_msgs:
+                return self.requests[-1] if self.requests else {
+                    "id": "cursor:latest", "timestamp": "", "querySource": "cursor-approx",
+                    "_upto": len(self.cursor_msgs), "_ctx": self.context,
+                }
+            return None
         if msg_id:
             rid = self.req_of_msg.get(msg_id)
             return next((r for r in self.requests if r.get("id") == rid), None)
@@ -355,6 +845,8 @@ class Session:
 
     def real_context(self, req):
         """The context size the API reported for the response to this request, if known."""
+        if req.get("querySource") == "cursor-approx":
+            return int(req.get("_ctx") or self.context or 0)
         rid = req.get("id")
         for rec in reversed(self.ctx_hist):
             if self.req_of_msg.get(rec[-1]) == rid:
@@ -368,16 +860,49 @@ class Session:
             if isinstance(b, dict) and b.get("type") == "tool_result":
                 self.results[b.get("tool_use_id")] = (ts, result_text(b.get("content")), bool(b.get("is_error")))
 
+    def _agent_for_who(self, who):
+        """Resolve 'agent:<id-prefix>' from the activity feed back to an Agent."""
+        if not who or not str(who).startswith("agent:"):
+            return None
+        key = str(who)[6:]
+        if key in self.agents:
+            return self.agents[key]
+        for aid, a in self.agents.items():
+            if aid.startswith(key) or key.startswith(aid[:len(key)]):
+                return a
+        return None
+
+    def _note_agent_skill(self, who, skill):
+        a = self._agent_for_who(who)
+        if a is not None and skill and skill not in a.skills:
+            a.skills.append(skill)
+
     def _tool(self, ts, who, name, inp, tid=None):
-        self.feed.append((ts, who, name, short_input(name, inp), tid, inp))
-        self.feed = sorted(self.feed, key=lambda x: x[0])[-300:]
+        self._feed_seq = getattr(self, "_feed_seq", 0) + 1
+        # (ts, who, tool, detail, tid, input, seq) — seq breaks ties when Cursor stamps share a minute
+        self.feed.append((ts, who, name, short_input(name, inp), tid, inp, self._feed_seq))
+        self.feed = sorted(self.feed, key=lambda x: (ts_sort_key(x[0]), x[6]))[-300:]
         if name in ("Agent", "Task"):
             self.agent_calls += 1
         if name == "Skill":
-            self.skill_calls.append((ts, who, inp.get("skill", "?"), "auto/Skill", tid, inp.get("args", "")))
-        text = inp.get("file_path", "") if name == "Read" else inp.get("command", "") if name == "Bash" else ""
+            skill = inp.get("skill", "?")
+            self.skill_calls.append((ts, who, skill, "auto/Skill", tid, inp.get("args", "")))
+            self._note_agent_skill(who, skill)
+        # Claude uses file_path; Cursor Read uses path; Shell/Bash may mention skill paths in the command.
+        if name == "Read":
+            text = inp.get("file_path") or inp.get("path") or ""
+        elif name in ("Bash", "Shell"):
+            text = inp.get("command", "")
+        else:
+            text = ""
         for m in re.finditer(r"/skills/(?:[^/\s]+/)*?([^/\s]+)/(SKILL\.md|(?:references|scripts|assets)/[^\s'\"|;&]+)", text):
-            self.skill_reads.setdefault(m.group(1), set()).add(Path(m.group(2)).name)
+            skill, fname = m.group(1), m.group(2)
+            self.skill_reads.setdefault(skill, set()).add(Path(fname).name)
+            self._note_agent_skill(who, skill)
+            # Cursor has no Skill tool — a Read of SKILL.md counts as an invocation.
+            if self.agent_type == "cursor" and fname == "SKILL.md":
+                if not any(c[2] == skill and c[3] == "read/SKILL.md" for c in self.skill_calls):
+                    self.skill_calls.append((ts, who, skill, "read/SKILL.md", tid, ""))
 
     # ---- subagent transcripts -------------------------------------------
     def _agent_event(self, a, e):
@@ -595,9 +1120,14 @@ def context_items(shape, msgs):
                 add("thinking", text.strip().split("\n")[0][:70] or "(hidden: only the signature is stored)", text, where)
             elif t == "text":
                 text = b.get("text", "")
-                first = text.strip().split("\n")[0][:70]
+                # Cursor wraps the real prompt in <user_query>; treat that as a user prompt.
+                uq = re.search(r"<user_query>(.*?)</user_query>", text, re.S)
+                prompt_text = uq.group(1).strip() if uq else text
+                first = prompt_text.strip().split("\n")[0][:70] if uq else text.strip().split("\n")[0][:70]
                 if role == "assistant":
                     add("assistant replies", first, text, where)
+                elif uq and is_real_prompt(prompt_text):
+                    add("user prompts", first, prompt_text, where)
                 elif role == "system" or text.lstrip().startswith("<") or not is_real_prompt(text):
                     tag = re.match(r"\s*<([\w-]+)", text)
                     add("reminders & attachments", (f"<{tag.group(1)}> " if tag else "") + first[:60], text, where)
@@ -632,7 +1162,7 @@ def render(s, limit):
     w = max(60, min(cols, 120))
     L = []
     hr = c(DIM, "─" * w)
-    L.append(c(BOLD, f"CLAUDE X-RAY") + c(DIM, f"  session {s.id[:8]}  ·  {s.path.parent.name[:50]}  ·  {datetime.now():%H:%M:%S}"))
+    L.append(c(BOLD, f"AGENT X-RAY [{s.agent_type.upper()}]") + c(DIM, f"  session {s.id[:8]}  ·  {s.path.parent.name[:50]}  ·  {datetime.now():%H:%M:%S}"))
     if s.last_prompt:
         L.append(c(DIM, "last prompt: ") + s.last_prompt[: w - 16])
     L.append(hr)
@@ -675,45 +1205,96 @@ def render(s, limit):
 
     # feed
     L.append(c(BOLD, "RECENT ACTIVITY"))
-    for ts, who, name, detail, *_ in sorted(s.feed, key=lambda x: x[0])[-10:]:
+    for ts, who, name, detail, *_ in sorted(s.feed, key=lambda x: (ts_sort_key(x[0]), x[6] if len(x) > 6 else 0), reverse=True)[:10]:
         whoc = c(CYAN, f"{who:12}") if who != "main" else c(DIM, f"{who:12}")
-        L.append(f"  {c(DIM, hhmm(ts))}  {whoc} {c(BOLD, f'{name[:10]:10}')} {detail[: w - 38]}")
+        L.append(f"  {c(DIM, hhmm(ts))}  {whoc} {c(BOLD, f'{name[:10]:10}')} {detail[: w - 42]}")
     return "\n".join(L)
 
 
-def last_prompt_of(f, tail_bytes=400_000):
-    """Last real user prompt, scanning only the end of the file."""
+def last_prompt_of(path, tail_bytes=400_000):
+    """The latest user prompt in the file, read cheaply from the end across agents."""
+    p = str(path)
     try:
-        with open(f, "rb") as fh:
+        with open(path, "rb") as fh:
             size = fh.seek(0, 2)
             fh.seek(max(0, size - tail_bytes))
             lines = fh.read().decode("utf-8", "replace").split("\n")
     except OSError:
         return ""
-    for l in reversed(lines):
-        if '"type":"user"' not in l:
-            continue
-        try:
-            e = json.loads(l)
-        except Exception:
-            continue
-        content = e.get("message", {}).get("content")
-        content = first_text(content)
-        if content.strip() and is_real_prompt(content):
-            return content.strip().replace("\n", " ")
+
+    if "/.codex/" in p or Path(path).name.startswith("rollout-"):
+        for l in reversed(lines):
+            if '"user_message"' in l:
+                try:
+                    d = json.loads(l)
+                    if d.get("payload", {}).get("type") == "user_message":
+                        m = d["payload"].get("message", "").strip()
+                        if m: return m.replace("\n", " ")
+                except Exception: pass
+            elif '"input_text"' in l:
+                try:
+                    d = json.loads(l)
+                    for c in d.get("payload", {}).get("content", []):
+                        if c.get("type") == "input_text":
+                            t = c.get("text", "").strip()
+                            if t and not t.startswith("<"):
+                                return t.replace("\n", " ")
+                except Exception: pass
+    elif "/.cursor/" in p:
+        for l in reversed(lines):
+            if '"role":"user"' in l or '"role": "user"' in l:
+                try:
+                    d = json.loads(l)
+                    if d.get("role") == "user":
+                        for c in d.get("message", {}).get("content", []):
+                            if c.get("type") == "text":
+                                t = c.get("text", "")
+                                q = re.search(r"<user_query>(.*?)</user_query>", t, re.S)
+                                if q: return q.group(1).strip().replace("\n", " ")
+                                if not t.startswith("<"):
+                                    return t.strip().replace("\n", " ")
+                except Exception: pass
+    elif "/.gemini/" in p or "antigravity" in p or Path(path).name == "transcript.jsonl":
+        for l in reversed(lines):
+            if '"USER_INPUT"' in l:
+                try:
+                    d = json.loads(l)
+                    if d.get("type") == "USER_INPUT":
+                        return str(d.get("content", "")).strip().replace("\n", " ")
+                except Exception: pass
+    else:
+        for l in reversed(lines):
+            if '"type":"user"' not in l:
+                continue
+            try:
+                e = json.loads(l)
+                content = e.get("message", {}).get("content")
+                content = first_text(content)
+                if content.strip() and is_real_prompt(content):
+                    return content.strip().replace("\n", " ")
+            except Exception: pass
     return ""
 
 
-def list_sessions(all_projects, cwd, n, headless=False):
-    return sorted(session_files(all_projects, cwd, headless), key=lambda f: f.stat().st_mtime, reverse=True)[:n]
+def list_sessions(all_projects, cwd, n, headless=False, agent="auto"):
+    return sorted(session_files(all_projects, cwd, headless, agent=agent), key=lambda f: f.stat().st_mtime, reverse=True)[:n]
 
 
-def resolve_session(arg):
+def resolve_session(arg, agent="auto"):
     p = Path(arg)
     if p.exists():
         return p
-    hits = list(PROJECTS.glob(f"*/{arg}*.jsonl"))
-    return hits[0] if hits else None
+    patterns = [
+        CLAUDE_PROJECTS / "*" / f"*{arg}*.jsonl",
+        CODEX_SESSIONS / "*" / "*" / "*" / f"*{arg}*.jsonl",
+        CURSOR_PROJECTS / "*" / "agent-transcripts" / "*" / f"*{arg}*.jsonl",
+        AGY_BRAIN / f"*{arg}*" / ".system_generated" / "logs" / "transcript.jsonl",
+    ]
+    for pat in patterns:
+        hits = list(Path(pat.anchor).glob(str(pat).lstrip(pat.anchor)))
+        if hits:
+            return hits[0]
+    return None
 
 
 # ---------------------------------------------------------------- Textual UI
@@ -819,8 +1400,13 @@ class ContextDetail(ModalScreen):
 
     def open_inside(self, req, label):
         if req is None:
-            self.app.notify("No request log for this session: it was recorded by an older Claude Code "
-                            "version, or this response has no logged request.", severity="warning", timeout=6)
+            if getattr(self.s, "agent_type", "claude") != "claude":
+                self.app.notify("What's-in-context needs Claude Code's request log; "
+                                f"{self.s.agent_type} transcripts don't include it.",
+                                severity="warning", timeout=6)
+            else:
+                self.app.notify("No request log for this session: it was recorded by an older Claude Code "
+                                "version, or this response has no logged request.", severity="warning", timeout=6)
             return
         self.app.push_screen(ContextContents(self.s, req, label))
 
@@ -909,9 +1495,13 @@ class ContextContents(ModalScreen):
         cm = (p.get("context_management") or {}).get("edits")
         if cm:
             out.append("context editing: " + ", ".join(e.get("type", "?") for e in cm) + "\n", style="dim")
-        out.append("The split between items is estimated from character counts"
-                   + (", scaled to the real total." if self.real else ".") +
-                   " The content is exactly what Claude Code sent.", style="dim italic")
+        if self.req.get("querySource") == "cursor-approx":
+            out.append("Estimated from the Cursor transcript (chat turns only). "
+                       "System prompt, tool definitions, and tool results are not logged.", style="dim italic")
+        else:
+            out.append("The split between items is estimated from character counts"
+                       + (", scaled to the real total." if self.real else ".") +
+                       " The content is exactly what Claude Code sent.", style="dim italic")
         return out
 
     def fill(self):
@@ -1175,25 +1765,38 @@ class Picker(ModalScreen):
 
     def load(self):
         box = self.query_one("#picker")
-        box.border_title = ("Recent sessions · " + ("all projects" if self.args.all else "current project")
+        ag_label = f"agent: {self.args.agent}" if hasattr(self.args, "agent") and self.args.agent != "auto" else "all agents"
+        box.border_title = (f"Recent sessions ({ag_label}) · " + ("all projects" if self.args.all else "current project")
                             + (" · including headless runs" if self.args.headless else ""))
         t = self.query_one(DataTable)
         t.clear(columns=True)
-        cols = ["when", "session"] + (["project"] if self.args.all else []) + ["last prompt"]
+        cols = ["agent", "when", "session"] + (["project"] if self.args.all else []) + ["last prompt"]
         t.add_columns(*cols)
-        auto = [Text("⟳ follow the newest", style="bold cyan"), Text("auto", style="dim")]
-        auto += [""] * (len(cols) - len(auto) - 1) + [Text("switches automatically after /clear", style="dim")]
+        auto = [Text("all", style="magenta"), Text("⟳ newest", style="bold cyan"), Text("auto", style="dim")]
+        auto += [""] * (len(cols) - len(auto) - 1) + [Text("switches automatically on activity", style="dim")]
         t.add_row(*auto, key=AUTO)
-        files = list_sessions(self.args.all, self.args.cwd, self.args.list, self.args.headless)
+        ag = getattr(self.args, "agent", "auto")
+        files = list_sessions(self.args.all, self.args.cwd, self.args.list, self.args.headless, agent=ag)
         for f in files:
-            sid = Text(f.stem[:8]) + (Text(" -p", style="dim") if is_headless(f) else Text(""))
-            row = [datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M"), sid]
+            ag_type = session_agent_label(f)
+            ag_color = {"claude": "cyan", "codex": "green", "cursor": "blue", "agy": "yellow"}.get(ag_type, "white")
+            sid_str = f.parents[2].name[:8] if f.name == "transcript.jsonl" else (f.stem.replace("rollout-", "").split("-")[-1][:8] if "rollout-" in f.name else f.stem[:8])
+            sid = Text(sid_str) + (Text(" -p", style="dim") if is_headless(f) else Text(""))
+            row = [Text(ag_type, style=f"bold {ag_color}"), datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M"), sid]
             if self.args.all:
-                row.append(f.parent.name[-30:])
+                pname = f.parent.name
+                if f.name == "transcript.jsonl":
+                    pname = f.parents[2].name[:25]
+                elif "agent-transcripts" in str(f):
+                    pname = f.parents[2].name.replace("Users-", "").replace("codes-", "")[:25]
+                elif "/.codex/" in str(f):
+                    c = codex_session_cwd(f)
+                    pname = Path(c).name if c else "codex"
+                row.append(pname[-30:])
             row.append(Text(last_prompt_of(f)[:90] or "(no prompts)"))
             t.add_row(*row, key=str(f))
         if not files and not self.args.headless:
-            hidden = len(session_files(self.args.all, self.args.cwd, headless=True))
+            hidden = len(session_files(self.args.all, self.args.cwd, headless=True, agent=ag))
             if hidden:
                 hint = [""] * (len(cols) - 1) + [Text(f"{hidden} headless `claude -p` runs hidden · h shows them",
                                                        style="dim italic")]
@@ -1223,7 +1826,7 @@ class Picker(ModalScreen):
 
 
 class XRay(App):
-    TITLE = "Claude X-Ray"
+    TITLE = "Agent X-Ray"
     CSS = """
     #prompt, #ctx, #ctxbar { height: 1; padding: 0 1; }
     #ctx:hover, #ctxbar:hover { background: $boost; }
@@ -1248,7 +1851,8 @@ class XRay(App):
     BINDINGS = [("q", "quit", "quit"), ("s", "pick", "sessions"), ("c", "context", "context"),
                 ("1", "focus('agents')", "agents"), ("2", "focus('skills')", "skills"),
                 ("3", "focus('feed')", "activity"), ("f", "focus_agent", "focus agent"),
-                ("b", "brief", "brief vs result"), ("p", "pause", "pause")]
+                ("b", "brief", "brief vs result"), ("p", "pause", "pause"),
+                ("r", "refresh", "refresh")]
 
     def __init__(self, args):
         super().__init__()
@@ -1273,11 +1877,11 @@ class XRay(App):
     def on_mount(self):
         self.query_one("#agents", DataTable).add_columns("", "description", "type", "ctx", "tools", "used?", "last tool", "skills")
         self.query_one("#skills", DataTable).add_columns("time", "skill", "how", "who")
-        self.query_one("#feed", DataTable).add_columns("time", "who", "tool", "detail", "")
+        self.query_one("#feed", DataTable).add_columns("when", "who", "tool", "detail", "")
         self.query_one("#feedbox").border_title = "Recent activity · Enter opens details"
         self.query_one("#feed").focus()
         if self.args.session:
-            path = resolve_session(self.args.session)
+            path = resolve_session(self.args.session, agent=getattr(self.args, "agent", "auto"))
             if not path:
                 self.exit(message=f"Session {self.args.session} not found.")
                 return
@@ -1301,7 +1905,7 @@ class XRay(App):
             self.open(result)
 
     def open_newest(self):
-        path = newest_session(self.args.all, self.args.cwd, self.args.headless)
+        path = newest_session(self.args.all, self.args.cwd, self.args.headless, agent=getattr(self.args, "agent", "auto"))
         if path:
             self.open(path)
         else:
@@ -1318,7 +1922,8 @@ class XRay(App):
         if self.paused:
             return
         if self.follow:
-            newest = newest_session(self.args.all, self.args.cwd, self.args.headless)
+            newest = newest_session(self.args.all, self.args.cwd, self.args.headless,
+                                   agent=getattr(self.args, "agent", "auto"))
             cur = self.session.path if self.session else None
             if newest and newest != cur and (cur is None or born(newest) > born(cur)
                                              or newest.stat().st_mtime > cur.stat().st_mtime + 2):
@@ -1336,6 +1941,19 @@ class XRay(App):
     def action_pause(self):
         self.paused = not self.paused
         self.notify("Paused" if self.paused else "Resumed")
+
+    def action_refresh(self):
+        """Hard reload the current session from disk (or the newest, if following)."""
+        if self.follow:
+            self.open_newest()
+        elif self.session:
+            self.open(self.session.path)
+        else:
+            self.open_newest()
+        if self.session:
+            self.notify(f"Refreshed · {self.session.id[:8]} · {len(self.session.feed)} activity")
+        else:
+            self.notify("No session to refresh", severity="warning")
 
     def action_focus(self, wid):
         self.query_one(f"#{wid}").focus()
@@ -1396,11 +2014,12 @@ class XRay(App):
     # ---- detail builders -----------------------------------------------------
     def detail_feed(self, entry):
         s = self.session
-        ts, who, name, short, tid, inp = entry
+        # feed rows are (ts, who, tool, detail, tid, input[, seq])
+        ts, who, name, short, tid, inp = entry[:6]
         parts = [kv(("when", hhmm(ts)), ("who", who), ("tool", Text(name, style="bold")),
                     ("summary", short), ("id", tid or "—")),
                  Rule("input", style="dim")]
-        if name == "Bash" and inp.get("command"):
+        if name in ("Bash", "Shell") and isinstance(inp, dict) and inp.get("command"):
             parts.append(code(inp["command"], "bash"))
             rest = {k: v for k, v in inp.items() if k != "command"}
             if rest:
@@ -1444,19 +2063,26 @@ class XRay(App):
         return out
 
     # ---- drawing -----------------------------------------------------------
-    def fill(self, tid, rows):
-        """Rebuild a table, keeping the cursor on the same item (or on top if it was there)."""
+    def fill(self, tid, rows, stick_top=False):
+        """Rebuild a table. stick_top=True keeps the newest row (row 0) in view — used for activity."""
         t = self.query_one(f"#{tid}", DataTable)
         keep = None
-        if t.row_count and t.cursor_row > 0:
+        if not stick_top and t.row_count and t.cursor_row > 0:
             keep = t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value
         t.clear()
         for key, cells, payload in rows:
             self.rows[key] = payload
             t.add_row(*cells, key=key)
-        if keep is not None:
-            try:
+        if not t.row_count:
+            return
+        try:
+            if stick_top or keep is None:
+                t.move_cursor(row=0, animate=False)
+            else:
                 t.move_cursor(row=t.get_row_index(keep), animate=False)
+        except Exception:
+            try:
+                t.move_cursor(row=0, animate=False)
             except Exception:
                 pass
 
@@ -1464,7 +2090,7 @@ class XRay(App):
         s = self.session
         limit = self.limit()
         mode = "following newest" if self.follow else "pinned session"
-        self.sub_title = f"{s.id[:8]} · {s.path.parent.name[-40:]} · {mode}" + (" · PAUSED" if self.paused else "")
+        self.sub_title = f"[{s.agent_type.upper()}] {s.id[:8]} · {s.path.parent.name[-40:]} · {mode}" + (" · PAUSED" if self.paused else "")
 
         self.query_one("#prompt", Static).update(
             Text.assemble(("last prompt: ", "dim"), s.last_prompt or "—"))
@@ -1487,11 +2113,14 @@ class XRay(App):
         self.query_one("#skillsbox").border_title = (
             f"[2] Skills · available {s.skills_available} · invoked {len(s.skill_calls)}"
             + (f" · new {len(s.skills_added)}" if s.skills_added else ""))
-        self.query_one("#feedbox").border_title = "[3] Recent activity · Enter opens details"
+        self.query_one("#feedbox").border_title = "[3] Recent activity · newest first · Enter opens details"
 
-        sig = (s.id, s.agent_calls, tuple((a.id, a.finished, a.tools, a.context, a.desc) for a in s.agents.values()),
+        newest = s.feed[-1] if s.feed else None
+        sig = (s.id, s.agent_calls, tuple((a.id, a.finished, a.tools, a.context, a.desc, tuple(a.skills)) for a in s.agents.values()),
                len(s.skill_calls), len(s.skills_added), sum(map(len, s.skill_reads.values())),
-               len(s.feed), s.feed[-1][:5] if s.feed else None, len(s.results), len(s.main_out), len(s.prompt_ts))
+               len(s.feed),
+               (newest[0], newest[2], newest[4], newest[6] if len(newest) > 6 else None) if newest else None,
+               len(s.results), len(s.main_out), len(s.prompt_ts), s.context, s.out_tokens)
         if sig == self._sig:
             return
         self._sig = sig
@@ -1519,19 +2148,28 @@ class XRay(App):
         self.fill("skills", rows)
 
         rows = []
-        for i, entry in enumerate(sorted(s.feed, key=lambda x: x[0], reverse=True)[:200]):
-            ts, who, name, detail, tid, _ = entry
+        # Newest first: parsed datetime, then seq (Cursor often stamps many tools with the same minute).
+        ordered = sorted(
+            enumerate(s.feed),
+            key=lambda it: (ts_sort_key(it[1][0]), it[1][6] if len(it[1]) > 6 else it[0]),
+            reverse=True,
+        )[:200]
+        for i, entry in ordered:
+            ts, who, name, detail, tid = entry[0], entry[1], entry[2], entry[3], entry[4]
             res = s.results.get(tid)
             st = Text("…", style="yellow") if res is None else Text("✗", style="bold red") if res[2] else Text("✓", style="green")
-            rows.append((f"fd:{tid or ts + name + str(i)}",
+            rows.append((f"fd:{i}:{tid or ts + name}",
                          (hhmm(ts), Text(who, style="dim" if who == "main" else "cyan"), Text(name, style="bold"),
                           Text(detail[:120]), st), ("feed", entry)))
-        self.fill("feed", rows)
+        # Always jump to row 0 so new activity isn't hidden under a stuck mid-list cursor.
+        self.fill("feed", rows, stick_top=True)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Live X-ray of a Claude Code session.")
+    ap = argparse.ArgumentParser(description="Live X-ray of AI coding agent sessions (Claude Code, Codex, Cursor, AGY).")
     ap.add_argument("--session", help="session id (or path to the .jsonl)")
+    ap.add_argument("--agent", choices=["auto", "claude", "codex", "cursor", "agy"], default="auto",
+                    help="target agent type (default: auto)")
     ap.add_argument("--all", action="store_true", help="list/follow sessions of every project")
     ap.add_argument("--headless", action="store_true",
                     help="also list/follow headless `claude -p` / SDK runs (hidden by default)")
@@ -1544,9 +2182,9 @@ def main():
     args = ap.parse_args()
 
     if args.once or not sys.stdout.isatty():
-        path = resolve_session(args.session) if args.session else newest_session(args.all, args.cwd, args.headless)
+        path = resolve_session(args.session, agent=args.agent) if args.session else newest_session(args.all, args.cwd, args.headless, agent=args.agent)
         if not path:
-            sys.exit("No interactive session found. Use --all, --headless (claude -p runs) or --session ID.")
+            sys.exit("No interactive session found. Use --all, --agent, --headless or --session ID.")
         s = Session(path)
         s.update()
         print(render(s, args.limit))
