@@ -24,6 +24,10 @@ SH
 chmod +x ~/.local/bin/claude-xray
 ```
 
+<img height="500" alt="image" src="https://github.com/user-attachments/assets/eb158389-a43a-409f-b710-8df6cbdefca3" />
+<img height="500" alt="image" src="https://github.com/user-attachments/assets/3799e1ab-b115-4a93-a224-4320f72fd7b5" />
+
+
 ## Usage
 
 Run it in a second terminal, from the same directory as your Claude Code session:
