@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="agent-xray" width="440">
+</p>
+
 # claude-xray (Agent X-Ray)
 
 Live X-ray of AI coding agent sessions in your terminal.
