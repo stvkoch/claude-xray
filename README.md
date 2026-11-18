@@ -50,18 +50,20 @@ Run it in a second terminal, from the same directory as your agent session:
 ```sh
 claude-xray                 # pick a session from a list
 claude-xray --agent codex   # filter to Codex sessions (or cursor, agy, claude)
-claude-xray --latest        # follow the newest session
+claude-xray --latest        # follow the newest session (with --agent auto: of the agent on screen)
 claude-xray --all           # list/follow sessions of every project
 claude-xray --session ID    # open a specific session id across any supported agent
 claude-xray --once          # print a plain-text snapshot and exit
-claude-xray --headless      # also list headless `claude -p` / SDK runs (hidden by default)
-claude-xray --cwd DIR       # sessions of another project directory (default: current directory)
+claude-xray --headless      # Claude only: also list headless `claude -p` / SDK runs (hidden by default)
+claude-xray --cwd DIR       # sessions started in exactly this directory (default: current directory)
 claude-xray --list 30       # how many sessions the picker shows (default 15)
 claude-xray --interval 2    # refresh every 2 seconds (default 1)
 claude-xray --limit 1000000 # context window for the % bar (default: from the model)
 ```
 
-`-l` is short for `--latest`. The context window is inferred from the model id: 1M for models with a 1M-token window or a `[1m]` suffix, 200K otherwise, and 1M once a session goes past 200K whatever the id says.
+`-l` is short for `--latest`. The context window is inferred from the model id: 1M for models with a 1M-token window or a `[1m]` suffix, 200K otherwise, and 1M once a session goes past 200K whatever the id says. Codex sessions use the window the transcript reports.
+
+Per-agent notes: **Inside the context** needs Claude Code's request log (Cursor gets a chat-turns-only estimate; Codex and AGY don't have it). Cursor logs no token usage, so its context is estimated from the transcript text and its tool results aren't shown. AGY sessions are matched to a project via `~/.gemini/antigravity-cli/history.jsonl`; ones it can't place only show with `--all`.
 
 | Key | Action |
 | --- | --- |
